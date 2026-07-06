@@ -1,0 +1,71 @@
+server:
+  port: 8081
+
+spring:
+  profiles:
+    active: local          # 加载 application-local.yaml（gitignored，存放真实Key）
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/rag_campus?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&createDatabaseIfNotExist=true
+    username: root
+    password: root
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      id-type: auto
+      table-prefix: tb_
+
+# ==================== DeepSeek API ====================
+# 注册地址: https://platform.deepseek.com
+# Embedding: DeepSeek 暂不提供独立Embedding API → 建议用阿里云DashScope
+# DashScope注册: https://dashscope.aliyun.com
+deepseek:
+  api-key: ${DEEPSEEK_API_KEY:your-deepseek-api-key}
+  base-url: https://api.deepseek.com
+  chat-model: deepseek-chat
+
+# Embedding 服务配置（二选一）
+# 方案A: 阿里云 DashScope（推荐，有免费额度）
+# 方案B: 本地 sentence-transformers 模型（不依赖外部API）
+embedding:
+  provider: ${EMBEDDING_PROVIDER:dashscope}          # dashscope / local
+  dashscope:
+    api-key: ${DASHSCOPE_API_KEY:your-dashscope-api-key}
+    base-url: https://dashscope.aliyuncs.com
+    model: text-embedding-v3
+
+# ==================== RAG 参数 ====================
+rag:
+  chunk:
+    size: 800            # 每个chunk最大字符数（中文政策文档建议800-1000）
+    overlap: 200         # 相邻chunk重叠字符数（size的25%）
+  retrieval:
+    top-k: 8             # 检索返回的最相关chunk数
+  conversation:
+    max-history: 10      # Redis中保留的最近对话轮数
+    ttl-hours: 24        # 对话过期时间（小时）

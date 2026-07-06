@@ -1,0 +1,91 @@
+# ============================================================
+# 校园智答 — 本地开发环境
+# 启动: docker compose up -d
+# 停止: docker compose down
+# 清数据: docker compose down -v
+# ============================================================
+
+services:
+
+  # ==================== MySQL 8.0 ====================
+  mysql:
+    image: mysql:8.0
+    container_name: rag-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: rag_campus
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./src/main/resources/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Redis 7 ====================
+  # 方案A: 基础 Redis（当前够用，镜像小）
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # 方案B: Redis Stack（含 RediSearch，后续向量检索升级用）
+  # 切换方式：注释掉上面的 redis 服务，取消下面两行的注释
+  # redis:
+  #   image: redis/redis-stack:7.2.0-v13
+  #   container_name: rag-redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #     - "8001:8001"     # RedisInsight 可视化管理界面
+  #   volumes:
+  #     - redis-data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+
+  # ==================== RabbitMQ 3.12 ====================
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rag-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"       # AMQP 协议端口
+      - "15672:15672"     # Web 管理界面
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:
