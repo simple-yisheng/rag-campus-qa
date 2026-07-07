@@ -14,6 +14,8 @@ CREATE TABLE tb_document (
     department      VARCHAR(128)  DEFAULT '' COMMENT '发布单位/学院',
     content         LONGTEXT      NOT NULL COMMENT '文档原始文本内容',
     file_type       VARCHAR(20)   DEFAULT 'TXT' COMMENT '源文件类型: TXT/PDF/DOCX',
+    content_hash    VARCHAR(32)   DEFAULT NULL COMMENT '文件内容MD5哈希，用于去重',
+    file_key        VARCHAR(500)  DEFAULT NULL COMMENT 'MinIO存储路径（原始文件）',
     status          VARCHAR(20)   DEFAULT 'PENDING' COMMENT '处理状态: PENDING-待处理 / PROCESSING-处理中 / DONE-已完成 / FAILED-失败',
     chunk_count     INT           DEFAULT 0 COMMENT '分块数量',
     create_time     DATETIME      DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',

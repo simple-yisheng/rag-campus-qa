@@ -59,6 +59,13 @@ embedding:
     base-url: https://dashscope.aliyuncs.com
     model: text-embedding-v3
 
+# ==================== MinIO 对象存储 ====================
+minio:
+  endpoint: http://localhost:9000
+  access-key: minioadmin
+  secret-key: minioadmin
+  bucket: rag-campus-documents
+
 # ==================== RAG 参数 ====================
 rag:
   chunk:

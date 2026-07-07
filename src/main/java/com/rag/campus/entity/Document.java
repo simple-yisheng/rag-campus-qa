@@ -39,6 +39,12 @@ public class Document {
     /** 源文件类型：TXT / PDF / DOCX */
     private String fileType;
 
+    /** 文件内容MD5哈希，用于去重 */
+    private String contentHash;
+
+    /** MinIO存储路径（原始文件） */
+    private String fileKey;
+
     /**
      * 处理状态：
      * PENDING    — 刚上传，等待处理

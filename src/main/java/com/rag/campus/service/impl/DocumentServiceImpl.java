@@ -1,6 +1,7 @@
 package com.rag.campus.service.impl;
 
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.crypto.digest.DigestUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.rag.campus.client.EmbeddingClient;
@@ -12,6 +13,7 @@ import com.rag.campus.mapper.DocumentMapper;
 import com.rag.campus.service.DocumentService;
 import com.rag.campus.support.DocumentChunker;
 import com.rag.campus.support.DocumentConverter;
+import com.rag.campus.support.MinioStorageService;
 import com.rag.campus.support.VectorStore;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -22,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -41,6 +44,7 @@ public class DocumentServiceImpl implements DocumentService {
     private final VectorStore vectorStore;
     private final RabbitTemplate rabbitTemplate;
     private final List<DocumentConverter> converters;
+    private final MinioStorageService minioStorage;
 
     /** 扩展名 → 转换器映射（启动时构建） */
     private final Map<String, DocumentConverter> converterMap = new HashMap<>();
@@ -60,13 +64,15 @@ public class DocumentServiceImpl implements DocumentService {
                                EmbeddingClient embeddingClient,
                                VectorStore vectorStore,
                                RabbitTemplate rabbitTemplate,
-                               List<DocumentConverter> converters) {
+                               List<DocumentConverter> converters,
+                               MinioStorageService minioStorage) {
         this.documentMapper = documentMapper;
         this.chunkMapper = chunkMapper;
         this.embeddingClient = embeddingClient;
         this.vectorStore = vectorStore;
         this.rabbitTemplate = rabbitTemplate;
         this.converters = converters;
+        this.minioStorage = minioStorage;
     }
 
     /** 构建扩展名 → 转换器映射 */
@@ -82,12 +88,44 @@ public class DocumentServiceImpl implements DocumentService {
 
     @Override
     public DocumentUploadResult upload(MultipartFile file, String title, String category, String department) {
-        // 1. 提取文本内容（通过转换器）
-        String text;
+        String originalName = file.getOriginalFilename();
+
+        // 1. 计算文件 MD5 哈希
+        byte[] fileBytes;
+        String md5;
         try {
-            text = extractText(file);
+            fileBytes = file.getBytes();
+            md5 = DigestUtil.md5Hex(fileBytes);
         } catch (IOException e) {
             log.error("文件读取失败", e);
+            return DocumentUploadResult.builder()
+                    .status("FAILED")
+                    .message("文件读取失败: " + e.getMessage())
+                    .build();
+        }
+
+        // 2. MD5 去重检查
+        Document existing = documentMapper.selectOne(
+                new LambdaQueryWrapper<Document>()
+                        .eq(Document::getContentHash, md5)
+                        .eq(Document::getStatus, "DONE")
+        );
+        if (existing != null) {
+            log.info("重复文件上传被拦截: md5={}, 已存在文档id={}, title={}", md5, existing.getId(), existing.getTitle());
+            return DocumentUploadResult.builder()
+                    .documentId(existing.getId())
+                    .title(existing.getTitle())
+                    .status("DUPLICATE")
+                    .message("该文件已上传过，文档标题：《" + existing.getTitle() + "》，无需重复上传")
+                    .build();
+        }
+
+        // 3. 提取文本内容（通过转换器）
+        String text;
+        try {
+            text = extractText(fileBytes, originalName);
+        } catch (IOException e) {
+            log.error("文本提取失败", e);
             return DocumentUploadResult.builder()
                     .status("FAILED")
                     .message("文件读取失败: " + e.getMessage())
@@ -101,22 +139,35 @@ public class DocumentServiceImpl implements DocumentService {
                     .build();
         }
 
-        // 2. 保存文档记录
+        // 4. 保存文档记录（先插入，获取自增ID）
         Document doc = new Document();
-        doc.setTitle(StrUtil.isBlank(title) ? file.getOriginalFilename() : title);
+        doc.setTitle(StrUtil.isBlank(title) ? originalName : title);
         doc.setCategory(category);
         doc.setDepartment(StrUtil.isBlank(department) ? "" : department);
         doc.setContent(text);
-        doc.setFileType(getFileType(file.getOriginalFilename()));
+        doc.setFileType(getFileType(originalName));
+        doc.setContentHash(md5);
         doc.setStatus("PENDING");
         doc.setChunkCount(0);
         doc.setCreateTime(LocalDateTime.now());
         documentMapper.insert(doc);
 
-        // 3. 发送MQ消息，异步处理
+        // 5. 保存原始文件到 MinIO
+        try {
+            String contentType = file.getContentType();
+            if (contentType == null) contentType = "application/octet-stream";
+            String fileKey = minioStorage.upload(doc.getId(), originalName, fileBytes, contentType);
+            doc.setFileKey(fileKey);
+            documentMapper.updateById(doc);
+        } catch (Exception e) {
+            log.error("MinIO存储失败，文档仍可正常检索: id={}", doc.getId(), e);
+            // MinIO 失败不影响检索流程，文档仍可正常分块
+        }
+
+        // 6. 发送MQ消息，异步处理
         rabbitTemplate.convertAndSend(DOCUMENT_PROCESS_EXCHANGE, DOCUMENT_PROCESS_ROUTING_KEY, doc.getId());
 
-        log.info("文档上传成功: id={}, title={}, 字符数={}", doc.getId(), doc.getTitle(), text.length());
+        log.info("文档上传成功: id={}, title={}, md5={}, 字符数={}", doc.getId(), doc.getTitle(), md5, text.length());
         return DocumentUploadResult.builder()
                 .documentId(doc.getId())
                 .title(doc.getTitle())
@@ -136,6 +187,15 @@ public class DocumentServiceImpl implements DocumentService {
     @Override
     public Document getById(Long id) {
         return documentMapper.selectById(id);
+    }
+
+    @Override
+    public InputStream getFileStream(Long documentId) {
+        Document doc = documentMapper.selectById(documentId);
+        if (doc == null || StrUtil.isBlank(doc.getFileKey())) {
+            return null;
+        }
+        return minioStorage.download(doc.getFileKey());
     }
 
     @Override
@@ -213,8 +273,7 @@ public class DocumentServiceImpl implements DocumentService {
     /**
      * 从上传文件中提取文本（通过 DocumentConverter 策略分发）
      */
-    private String extractText(MultipartFile file) throws IOException {
-        String filename = file.getOriginalFilename();
+    private String extractText(byte[] fileBytes, String filename) throws IOException {
         if (filename == null) {
             throw new IOException("文件名为空");
         }
@@ -232,7 +291,7 @@ public class DocumentServiceImpl implements DocumentService {
             throw new IOException("不支持的文件格式: " + ext + "，当前支持: " + converterMap.keySet());
         }
 
-        return converter.convert(file.getBytes(), filename);
+        return converter.convert(fileBytes, filename);
     }
 
     private String getFileType(String filename) {

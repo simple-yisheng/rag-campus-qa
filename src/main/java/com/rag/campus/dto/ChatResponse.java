@@ -33,6 +33,8 @@ public class ChatResponse {
     @NoArgsConstructor
     @AllArgsConstructor
     public static class SourceInfo {
+        /** 文档ID */
+        private Long documentId;
         /** 文档标题 */
         private String title;
         /** chunk序号 */

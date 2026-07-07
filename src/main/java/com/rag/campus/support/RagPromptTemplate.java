@@ -93,6 +93,7 @@ public class RagPromptTemplate {
             }
 
             return ChatResponse.SourceInfo.builder()
+                    .documentId(chunk.getDocumentId())
                     .title(doc != null ? doc.getTitle() : "未知")
                     .chunkIndex(chunk.getChunkIndex())
                     .score((double) hit.getScore())
