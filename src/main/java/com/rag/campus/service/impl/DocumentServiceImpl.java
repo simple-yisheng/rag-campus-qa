@@ -223,7 +223,7 @@ public class DocumentServiceImpl implements DocumentService {
         // 提取扩展名（含点，如 ".pdf"）
         int dotIndex = ext.lastIndexOf('.');
         if (dotIndex < 0) {
-            throw new IOException("无法识别文件类型，请上传 .txt / .md / .pdf 格式的文件");
+            throw new IOException("无法识别文件类型，请上传 .txt / .md / .pdf / .docx / .doc 格式的文件");
         }
         ext = ext.substring(dotIndex);
 
@@ -239,7 +239,7 @@ public class DocumentServiceImpl implements DocumentService {
         if (filename == null) return "UNKNOWN";
         String lower = filename.toLowerCase();
         if (lower.endsWith(".pdf")) return "PDF";
-        if (lower.endsWith(".docx")) return "DOCX";
+        if (lower.endsWith(".docx") || lower.endsWith(".doc")) return "DOCX";
         if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "MD";
         if (lower.endsWith(".txt")) return "TXT";
         return "UNKNOWN";
