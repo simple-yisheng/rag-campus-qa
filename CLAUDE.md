@@ -105,7 +105,6 @@ rag.conversation.ttl-hours: 24
 | P2 | 对话标题重命名 | 左侧会话列表支持双击/右键重命名 |
 | P2 | sessionId 缩短 | 当前 UUID 偏长，改用短 ID（如 6 位字母数字） |
 | P2 | 文件访问 URL 安全 | `GET /api/documents/{id}/file` 改为使用随机 token，避免用户遍历 ID 访问他人文件 |
-| P2 | README.md | 项目说明文档 |
 | P2 | 服务重启时 PROCESSING 状态补偿 | 扫描 status=PROCESSING 重新投 MQ |
 | P3 | Embedding 重试（3次指数退避） | |
 | P3 | 检索低分拦截（score < 0.5 不调 LLM） | |
