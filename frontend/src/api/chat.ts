@@ -5,7 +5,10 @@ const api = axios.create({ baseURL: '/api' })
 export interface SourceInfo {
   documentId: number
   title: string
+  fileType?: string
   chunkIndex: number
+  pageStart?: number
+  pageEnd?: number
   score: number
   snippet: string
 }

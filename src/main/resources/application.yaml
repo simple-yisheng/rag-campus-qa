@@ -66,6 +66,14 @@ minio:
   secret-key: minioadmin
   bucket: rag-campus-documents
 
+# ==================== Office 预览转换 ====================
+# 需要安装 LibreOffice；Windows 可把 libreoffice-path 改为 soffice.exe 的绝对路径。
+office:
+  preview:
+    enabled: true
+    libreoffice-path: ${LIBREOFFICE_PATH:soffice}
+    timeout-seconds: 60
+
 # ==================== RAG 参数 ====================
 rag:
   chunk:
@@ -73,6 +81,7 @@ rag:
     overlap: 200         # 相邻chunk重叠字符数（size的25%）
   retrieval:
     top-k: 12            # 检索返回的最相关chunk数（长文档/表格密集场景需更大窗口）
+    min-score: 0.55      # 检索最低分阈值（余弦相似度+关键词加分），低于此的chunk不参与LLM和来源
   conversation:
     max-history: 10      # Redis中保留的最近对话轮数
     ttl-hours: 24        # 对话过期时间（小时）

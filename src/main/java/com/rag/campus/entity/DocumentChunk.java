@@ -26,6 +26,12 @@ public class DocumentChunk {
     /** 分块文本内容 */
     private String chunkText;
 
+    /** PDF 命中起始页码（1-based，非 PDF 或无法定位时为空） */
+    private Integer pageStart;
+
+    /** PDF 命中结束页码（1-based，非 PDF 或无法定位时为空） */
+    private Integer pageEnd;
+
     /**
      * 向量数据，JSON格式的float数组
      * 例如: [0.0123, -0.0456, 0.0789, ...]

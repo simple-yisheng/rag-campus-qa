@@ -214,16 +214,43 @@ public class DocumentChunker {
             }
         }
 
-        // 过滤目录条目：开头连续的超短 section（< 80 字，含页码）视为 TOC，跳过
-        int firstRealSection = 0;
+        // 过滤目录页 — 查找"长section → 连续短section → 长section"的 TOC 夹层
+        // 如果找不到夹层，回退到跳过开头所有短section
+        int tocStart = -1;
+        int tocEnd = -1;
+        boolean seenLong = false;
+
         for (int i = 0; i < sections.size(); i++) {
-            if (sections.get(i).length() >= 80) {
-                firstRealSection = i;
-                break;
+            boolean isLong = sections.get(i).length() >= 200;
+            if (isLong) {
+                if (tocStart >= 0) {
+                    tocEnd = i;
+                    break;
+                }
+                seenLong = true;
+            } else if (seenLong && tocStart < 0) {
+                // 在长section之后第一次遇到短section → TOC 开始
+                tocStart = i;
             }
         }
-        if (firstRealSection > 0) {
-            sections = sections.subList(firstRealSection, sections.size());
+
+        if (tocStart > 0 && tocEnd > tocStart) {
+            // 找到 TOC 夹层：删除 [tocStart, tocEnd)
+            List<String> filtered = new ArrayList<>(sections.subList(0, tocStart));
+            filtered.addAll(sections.subList(tocEnd, sections.size()));
+            sections = filtered;
+        } else {
+            // 无夹层，回退：跳过开头所有短section
+            int firstReal = 0;
+            for (int i = 0; i < sections.size(); i++) {
+                if (sections.get(i).length() >= 200) {
+                    firstReal = i;
+                    break;
+                }
+            }
+            if (firstReal > 0) {
+                sections = new ArrayList<>(sections.subList(firstReal, sections.size()));
+            }
         }
 
         List<String> chunks = new ArrayList<>();
@@ -235,6 +262,35 @@ public class DocumentChunker {
             }
         }
         return chunks;
+    }
+
+    /**
+     * 判断一个 Q section 是否为目录条目
+     * <p>
+     * 目录条目特征（满足任一即判定为目录）：
+     * 1. 极短：< 80 字
+     * 2. 省略号引导符：含 ... / …… / …（如 "Q1 校园卡..........42"）
+     * 3. 短条目以页码结尾：长度 < 200 且末尾是空白/点号+数字
+     * 4. 纯问题无答案：长度 < 150 且不含句号/分号
+     */
+    private boolean isTocEntry(String section) {
+        String trimmed = section.trim();
+        int len = trimmed.length();
+
+        // 1. 极短
+        if (len < 80) return true;
+
+        // 2. 含省略号引导符（…… 或 ... 或 . . . 或单个…）
+        if (trimmed.contains("...") || trimmed.contains("……")
+                || trimmed.contains("…") || trimmed.contains(". . .")) return true;
+
+        // 3. 短条目以页码结尾（如 ".....42"、" 42"、"……42"）
+        if (len < 200 && trimmed.matches("(?s).*[.。…\\s]+\\d{1,3}\\s*$")) return true;
+
+        // 4. 仅含问题无答案：短于150字且没有句号/分号（只有 Q 标题，无回答正文）
+        if (len < 150 && !trimmed.contains("。") && !trimmed.contains("；")) return true;
+
+        return false;
     }
 
     // ==================== 策略三：中文结构切分 ====================

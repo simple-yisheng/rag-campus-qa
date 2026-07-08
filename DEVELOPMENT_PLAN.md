@@ -4,9 +4,9 @@
 >
 > 技术栈：Spring Boot 3.2 + MyBatis-Plus + Redis + RabbitMQ + DeepSeek + DashScope + MinIO + Vue 3
 >
-> 开发日期：2026/07/06 — 2026/07/07
+> 开发日期：2026/07/06 — 2026/07/08
 >
-> **当前进度：前后端功能已基本完成，进入体验优化阶段。**
+> **当前进度：所有 P1 任务已完成，P2/P3 优化进行中。**
 
 ---
 
@@ -52,6 +52,11 @@
 | F11 | Vue 3 前端 | 对话页 + 文档管理页（TDesign Chat） | P2 | ✅ |
 | F12 | MD5去重 | 相同文件拦截重复上传 | P1 | ✅ |
 | F13 | MinIO对象存储 | 原始文件保存 + 下载预览 | P1 | ✅ |
+| F14 | 多轮对话上下文 | Redis瘦身Q&A + 查询改写 | P1 | ✅ |
+| F15 | 检索增强 | 文档标题匹配 + 多样性截断 | P1 | ✅ |
+| F16 | 参考资料定位 | PdfViewer(PDF.js) + 页码定位 + 文字高亮 + Word→PDF预览 | P1 | ✅ |
+| F17 | Markdown渲染 | marked库 + 表格CSS | P2 | ✅ |
+| F18 | 表格感知分块 | chunker表格检测 + PDF坐标表格识别 | P1 | ✅ |
 
 ### 1.3 文档分类设计
 
@@ -93,13 +98,14 @@ rag-campus-qa/
 │       ├── App.vue
 │       ├── router/index.ts
 │       ├── api/chat.ts, document.ts
+│       ├── components/PdfViewer.vue
 │       └── views/ChatView.vue, DocumentView.vue
 │
 ├── src/main/resources/
 │   ├── application.yaml
 │   └── db/init.sql, migration.sql
 │
-└── src/main/java/com/rag/campus/
+├── src/main/java/com/rag/campus/
     ├── common/Result.java
     ├── config/{AppConfig, RabbitMQConfig, MinioConfig, WebMvcConfig}
     ├── entity/{Document, DocumentChunk, Conversation}
@@ -113,6 +119,7 @@ rag-campus-qa/
     │   ├── RagPromptTemplate.java
     │   ├── MinioStorageService.java
     │   ├── MinioInitializer.java
+    │   ├── OfficePreviewService.java
     │   └── impl/{PdfBoxConverter, PlainTextConverter, DocxConverter, MarkItDownConverter}
     ├── service/{DocumentService, RagService}
     │   └── impl/{DocumentServiceImpl, RagServiceImpl, DocumentProcessConsumer}
@@ -183,11 +190,11 @@ Vue 3 前端（TDesign Chat）
 
 ## 五、数据库设计
 
-- `tb_document`：id, title, category, department, content, file_type, content_hash(MD5), file_key(MinIO路径), status, chunk_count
-- `tb_document_chunk`：id, document_id(FK CASCADE), chunk_index, chunk_text, embedding(JSON), create_time
+- `tb_document`：id, title, category, department, content, file_type, content_hash(MD5), file_key(MinIO路径), preview_file_key(Word→PDF预览), status, chunk_count
+- `tb_document_chunk`：id, document_id(FK CASCADE), chunk_index, chunk_text, page_start(页码定位), page_end, embedding(JSON), create_time
 - `tb_conversation`：id, session_id, question, answer, sources(JSON), create_time
 
-Redis: `rag:conversation:{sessionId}` → JSON [{role, content}], 24h TTL
+Redis: `rag:conversation:{sessionId}` → JSON [{role, content}], 24h TTL, 仅存瘦身Q&A
 
 ---
 
@@ -198,12 +205,14 @@ Redis: `rag:conversation:{sessionId}` → JSON [{role, content}], 24h TTL
 | POST | /api/documents/upload | 上传文档 |
 | GET | /api/documents | 文档列表 |
 | GET | /api/documents/{id} | 文档详情 |
-| GET | /api/documents/{id}/file | 下载/预览原始文件 |
+| GET | /api/documents/{id}/file | 下载/预览原始文件（?download=true 强制下载） |
+| GET | /api/documents/{id}/preview | PDF 预览（PDF原始/Word转PDF） |
+| GET | /api/documents/{id}/content | 文档完整文本+chunks（参考资料抽屉用） |
 | DELETE | /api/documents/{id} | 删除文档 |
 | POST | /api/chat/ask | 提问 |
 | GET | /api/chat/history/{sessionId} | 对话历史 |
 
-SourceInfo 含 documentId，前端可据此跳转原文。
+SourceInfo 含 documentId + fileType + pageStart/pageEnd + chunkIndex + snippet，前端据此选择 PDF/文本模式展示。
 
 ---
 
@@ -215,35 +224,29 @@ SourceInfo 含 documentId，前端可据此跳转原文。
 |------|------|
 | 7/6 | Docker环境、DeepSeek+DashScope调通、PDFBox、DocumentConverter、分块器、Embedding、关键词重排、RAG全链路、多轮对话、content清空、文档缓存 |
 | 7/7 | DOCX/DOC支持（POI+表格→Markdown）、MinIO对象存储、MD5去重、参考资料documentId+去重、Vue 3前端（TDesign Chat对话页+文档管理页）、SPA路由回退、文档删除（级联）、前端历史加载、Docker数据迁移D盘 |
+| 7/8 | **多轮对话上下文**（Redis瘦身+查询改写）、**表格分块修复**（chunker表格感知+PdfBoxConverter表格检测）、**检索增强**（文档标题匹配+多样性截断）、**参考资料定位升级**（PDF页码推断+Word→PDF预览+PdfViewer组件+文本降级模式）、**前端Markdown升级**（marked库表格渲染） |
 
 ---
 
 ## 八、待完成事项
 
-### P1 — 体验核心
-
-| # | 任务 | 说明 |
-|---|------|------|
-| 1 | **多轮对话上下文** | ① Redis历史瘦身：仅存原始Q&A，不存chunk ② 查询改写：追问先结合上文LLM改写再检索 |
-| 2 | **参考资料定位** | 点击→侧边抽屉展示全文+高亮chunk |
-
 ### P2 — 体验优化
 
 | # | 任务 | 说明 |
 |---|------|------|
-| 3 | 对话标题重命名 | 双击/右键编辑 |
-| 4 | sessionId缩短 | 6位字母数字 |
-| 5 | 文件URL安全 | id→随机token，防遍历 |
-| 6 | README.md | 项目说明 |
-| 7 | PROCESSING补偿 | 重启扫描重新投MQ |
+| 1 | 对话标题重命名 | 双击/右键编辑 |
+| 2 | sessionId缩短 | 6位字母数字 |
+| 3 | 文件URL安全 | id→随机token，防遍历 |
+| 4 | README.md | 项目说明 |
+| 5 | PROCESSING补偿 | 重启扫描重新投MQ |
 
 ### P3 — 健壮性
 
 | # | 任务 |
 |---|------|
-| 8 | Embedding重试（3次指数退避） |
-| 9 | 检索低分拦截（score<0.5不调LLM） |
-| 10 | VectorStore接口化 |
+| 6 | Embedding重试（3次指数退避） |
+| 7 | 检索低分拦截（score<0.5不调LLM） |
+| 8 | VectorStore接口化 |
 
 ---
 
@@ -259,8 +262,9 @@ SourceInfo 含 documentId，前端可据此跳转原文。
 - **分块策略**：4级自适应（MD/Q&A/中文结构/滑动窗口），DOCX表格→Markdown表格
 - **去重**：MD5哈希，content_hash列
 - **DocumentConverter**：策略模式，Spring自动注入，加格式不改代码
-- **多轮对话**：Redis 24h TTL + MySQL持久化（已知问题：历史含chunk，待改为仅Q&A+查询改写）
-- **参考资料定位**：chunk拼接还原全文 + 目标chunk高亮（待完成）
+- **多轮对话**：Redis瘦身Q&A(去chunk) + 查询改写 + MySQL持久化
+- **检索增强**：关键词加权 + 文档标题实体匹配 + 文档多样性截断
+- **参考资料定位**：PDF页码推断 + PdfViewer(PDF.js)渲染 + 文字高亮 + Word→LibreOffice转PDF预览
 
 ---
 
@@ -313,9 +317,15 @@ cd frontend && npm run build # → target/classes/static/
 | 12 | 参考资料同文档重复 | buildSources按documentId去重 |
 | 13 | 前端刷新对话丢失 | 从后端API加载历史 |
 | 14 | 参考资料重复文档显示 | 按documentId去重保留最高分 |
+| 15 | 跨文档语义污染 | boostByDocumentTitle + applyDocumentDiversity |
+| 16 | 表格跨chunk表头丢失 | chunkBySlidingWindow 表格感知补表头 |
+| 17 | PDF表格行列丢失 | PdfBoxConverter 坐标分析→Markdown表格 |
+| 18 | PDF下标字符游离 | 不覆盖writeString，保留下标处理 |
+| 19 | Word文档PDF预览 | OfficePreviewService(LibreOffice) |
+| 20 | Spring Boot不识别.mjs | WebMvcConfig MIME映射 |
 
 ---
 
-> **最后更新：2026/07/07**
+> **最后更新：2026/07/08**
 >
-> **当前状态：** 前后端已基本完成。P1待解决：多轮对话上下文、参考资料定位。
+> **当前状态：** 所有 P1 任务已完成。P2/P3 体验优化进行中。

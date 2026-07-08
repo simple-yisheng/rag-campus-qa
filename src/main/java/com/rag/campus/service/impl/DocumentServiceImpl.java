@@ -14,9 +14,12 @@ import com.rag.campus.service.DocumentService;
 import com.rag.campus.support.DocumentChunker;
 import com.rag.campus.support.DocumentConverter;
 import com.rag.campus.support.MinioStorageService;
+import com.rag.campus.support.OfficePreviewService;
 import com.rag.campus.support.VectorStore;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -30,6 +33,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 文档管理服务实现
@@ -45,9 +49,13 @@ public class DocumentServiceImpl implements DocumentService {
     private final RabbitTemplate rabbitTemplate;
     private final List<DocumentConverter> converters;
     private final MinioStorageService minioStorage;
+    private final OfficePreviewService officePreviewService;
 
     /** 扩展名 → 转换器映射（启动时构建） */
     private final Map<String, DocumentConverter> converterMap = new HashMap<>();
+
+    /** 原始文件提取后的完整文本缓存，用于参考资料抽屉快速展示和定位。 */
+    private final Map<Long, String> displayContentCache = new ConcurrentHashMap<>();
 
     @Value("${rag.chunk.size:512}")
     private int chunkSize;
@@ -65,7 +73,8 @@ public class DocumentServiceImpl implements DocumentService {
                                VectorStore vectorStore,
                                RabbitTemplate rabbitTemplate,
                                List<DocumentConverter> converters,
-                               MinioStorageService minioStorage) {
+                               MinioStorageService minioStorage,
+                               OfficePreviewService officePreviewService) {
         this.documentMapper = documentMapper;
         this.chunkMapper = chunkMapper;
         this.embeddingClient = embeddingClient;
@@ -73,6 +82,7 @@ public class DocumentServiceImpl implements DocumentService {
         this.rabbitTemplate = rabbitTemplate;
         this.converters = converters;
         this.minioStorage = minioStorage;
+        this.officePreviewService = officePreviewService;
     }
 
     /** 构建扩展名 → 转换器映射 */
@@ -164,7 +174,20 @@ public class DocumentServiceImpl implements DocumentService {
             // MinIO 失败不影响检索流程，文档仍可正常分块
         }
 
-        // 6. 发送MQ消息，异步处理
+        // 6. Word 文档生成 PDF 预览，供前端复用 PDF.js 原格式展示。
+        if (isWordDocument(doc.getFileType()) && StrUtil.isNotBlank(doc.getFileKey())) {
+            try {
+                byte[] previewPdf = officePreviewService.convertWordToPdf(fileBytes, originalName);
+                String previewName = buildPreviewFilename(originalName);
+                String previewKey = minioStorage.upload(doc.getId(), previewName, previewPdf, "application/pdf");
+                doc.setPreviewFileKey(previewKey);
+                documentMapper.updateById(doc);
+            } catch (Exception e) {
+                log.warn("Word预览PDF生成失败，将使用文本兜底展示: documentId={}, filename={}", doc.getId(), originalName, e);
+            }
+        }
+
+        // 7. 发送MQ消息，异步处理
         rabbitTemplate.convertAndSend(DOCUMENT_PROCESS_EXCHANGE, DOCUMENT_PROCESS_ROUTING_KEY, doc.getId());
 
         log.info("文档上传成功: id={}, title={}, md5={}, 字符数={}", doc.getId(), doc.getTitle(), md5, text.length());
@@ -199,6 +222,21 @@ public class DocumentServiceImpl implements DocumentService {
     }
 
     @Override
+    public InputStream getPreviewFileStream(Long documentId) {
+        Document doc = documentMapper.selectById(documentId);
+        if (doc == null) {
+            return null;
+        }
+        if ("PDF".equals(doc.getFileType()) && StrUtil.isNotBlank(doc.getFileKey())) {
+            return minioStorage.download(doc.getFileKey());
+        }
+        if (isWordDocument(doc.getFileType()) && StrUtil.isNotBlank(doc.getPreviewFileKey())) {
+            return minioStorage.download(doc.getPreviewFileKey());
+        }
+        return null;
+    }
+
+    @Override
     @Transactional
     public void delete(Long documentId) {
         Document doc = documentMapper.selectById(documentId);
@@ -208,9 +246,13 @@ public class DocumentServiceImpl implements DocumentService {
         if (StrUtil.isNotBlank(doc.getFileKey())) {
             minioStorage.delete(doc.getFileKey());
         }
+        if (StrUtil.isNotBlank(doc.getPreviewFileKey())) {
+            minioStorage.delete(doc.getPreviewFileKey());
+        }
 
         // 删除向量索引
         vectorStore.removeByDocumentId(documentId);
+        displayContentCache.remove(documentId);
 
         // DB 删除（chunks 通过 CASCADE 自动删除）
         documentMapper.deleteById(documentId);
@@ -241,6 +283,8 @@ public class DocumentServiceImpl implements DocumentService {
                 return;
             }
 
+            List<PageRange> pageRanges = inferPdfPageRanges(doc, chunkTexts);
+
             // === 第二步：批量向量化 ===
             List<float[]> embeddings = embeddingClient.embedBatch(chunkTexts);
             if (embeddings.size() != chunkTexts.size()) {
@@ -258,6 +302,11 @@ public class DocumentServiceImpl implements DocumentService {
                 chunk.setDocumentId(documentId);
                 chunk.setChunkIndex(i);
                 chunk.setChunkText(chunkTexts.get(i));
+                if (i < pageRanges.size()) {
+                    PageRange pageRange = pageRanges.get(i);
+                    chunk.setPageStart(pageRange.start());
+                    chunk.setPageEnd(pageRange.end());
+                }
                 chunk.setEmbedding(JSONUtil.toJsonStr(embeddings.get(i)));
                 chunk.setCreateTime(LocalDateTime.now());
                 chunkMapper.insert(chunk);
@@ -285,6 +334,165 @@ public class DocumentServiceImpl implements DocumentService {
             doc.setStatus("FAILED");
             documentMapper.updateById(doc);
         }
+    }
+
+    @Override
+    public String getDocumentContent(Long documentId) {
+        Document doc = documentMapper.selectById(documentId);
+        if (doc == null) return null;
+
+        String cached = displayContentCache.get(documentId);
+        if (StrUtil.isNotBlank(cached)) {
+            return cached;
+        }
+
+        if (StrUtil.isNotBlank(doc.getFileKey())) {
+            try (InputStream stream = getFileStream(documentId)) {
+                if (stream != null) {
+                    String text = extractText(stream.readAllBytes(), getOriginalFilename(doc));
+                    displayContentCache.put(documentId, text);
+                    return text;
+                }
+            } catch (Exception e) {
+                log.warn("从原始文件提取展示全文失败，将回退到 chunks 拼接: documentId={}", documentId, e);
+            }
+        }
+
+        if (StrUtil.isNotBlank(doc.getContent())) {
+            return doc.getContent();
+        }
+
+        List<DocumentChunk> chunks = getDocumentChunks(documentId);
+
+        if (chunks.isEmpty()) return null;
+
+        return chunks.stream()
+                .map(DocumentChunk::getChunkText)
+                .filter(StrUtil::isNotBlank)
+                .collect(java.util.stream.Collectors.joining("\n\n"));
+    }
+
+    @Override
+    public List<DocumentChunk> getDocumentChunks(Long documentId) {
+        return chunkMapper.selectList(
+                new LambdaQueryWrapper<DocumentChunk>()
+                        .eq(DocumentChunk::getDocumentId, documentId)
+                        .orderByAsc(DocumentChunk::getChunkIndex)
+        );
+    }
+
+    private List<PageRange> inferPdfPageRanges(Document doc, List<String> chunkTexts) {
+        List<PageRange> ranges = new ArrayList<>();
+        if (!hasPdfPreview(doc)) {
+            return ranges;
+        }
+
+        try {
+            PdfPageIndex pageIndex = buildPdfPageIndex(doc);
+            if (pageIndex.normalizedText().isEmpty()) {
+                return ranges;
+            }
+
+            int searchFrom = 0;
+            for (String chunkText : chunkTexts) {
+                LocatedPageRange located = locateChunkInPdf(chunkText, pageIndex, searchFrom);
+                if (located == null) {
+                    ranges.add(new PageRange(null, null));
+                    continue;
+                }
+                ranges.add(new PageRange(located.pageStart(), located.pageEnd()));
+                searchFrom = Math.max(0, located.normalizedStart() - Math.max(20, chunkOverlap));
+            }
+            log.info("PDF页码定位完成: documentId={}, located={}/{}",
+                    doc.getId(), ranges.stream().filter(PageRange::located).count(), chunkTexts.size());
+        } catch (Exception e) {
+            log.warn("PDF页码定位失败，将不写入chunk页码: documentId={}", doc.getId(), e);
+            return new ArrayList<>();
+        }
+        return ranges;
+    }
+
+    private PdfPageIndex buildPdfPageIndex(Document doc) throws IOException {
+        StringBuilder normalizedText = new StringBuilder();
+        List<Integer> pageByChar = new ArrayList<>();
+
+        try (InputStream stream = getPreviewFileStream(doc.getId());
+             PDDocument pdf = PDDocument.load(stream)) {
+            PDFTextStripper stripper = new PDFTextStripper();
+            stripper.setSortByPosition(true);
+
+            for (int page = 1; page <= pdf.getNumberOfPages(); page++) {
+                stripper.setStartPage(page);
+                stripper.setEndPage(page);
+                String pageText = stripper.getText(pdf);
+                appendNormalizedPageText(pageText, page, normalizedText, pageByChar);
+            }
+        }
+
+        return new PdfPageIndex(normalizedText.toString(), pageByChar);
+    }
+
+    private void appendNormalizedPageText(String text,
+                                          int page,
+                                          StringBuilder normalizedText,
+                                          List<Integer> pageByChar) {
+        if (text == null) return;
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (!Character.isWhitespace(ch)) {
+                normalizedText.append(ch);
+                pageByChar.add(page);
+            }
+        }
+    }
+
+    private LocatedPageRange locateChunkInPdf(String chunkText, PdfPageIndex pageIndex, int searchFrom) {
+        String normalizedChunk = normalizeForPageMatch(chunkText);
+        if (normalizedChunk.length() < 8) return null;
+
+        List<String> candidates = buildPageMatchCandidates(normalizedChunk);
+        for (String candidate : candidates) {
+            int start = pageIndex.normalizedText().indexOf(candidate, Math.min(searchFrom, pageIndex.normalizedText().length()));
+            if (start < 0 && searchFrom > 0) {
+                start = pageIndex.normalizedText().indexOf(candidate);
+            }
+            if (start >= 0) {
+                int end = Math.min(start + candidate.length() - 1, pageIndex.pageByChar().size() - 1);
+                return new LocatedPageRange(
+                        pageIndex.pageByChar().get(start),
+                        pageIndex.pageByChar().get(end),
+                        start
+                );
+            }
+        }
+        return null;
+    }
+
+    private List<String> buildPageMatchCandidates(String normalizedChunk) {
+        int[] lengths = { normalizedChunk.length(), 300, 200, 120, 80, 40, 24 };
+        List<String> candidates = new ArrayList<>();
+        for (int length : lengths) {
+            int actualLength = Math.min(length, normalizedChunk.length());
+            if (actualLength >= 8) {
+                String candidate = normalizedChunk.substring(0, actualLength);
+                if (!candidates.contains(candidate)) {
+                    candidates.add(candidate);
+                }
+            }
+        }
+        return candidates;
+    }
+
+    private String normalizeForPageMatch(String text) {
+        if (text == null) return "";
+        StringBuilder normalized = new StringBuilder();
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (!Character.isWhitespace(ch)) {
+                normalized.append(ch);
+            }
+        }
+        return normalized.toString();
     }
 
     // ==================== 私有方法 ====================
@@ -317,9 +525,60 @@ public class DocumentServiceImpl implements DocumentService {
         if (filename == null) return "UNKNOWN";
         String lower = filename.toLowerCase();
         if (lower.endsWith(".pdf")) return "PDF";
-        if (lower.endsWith(".docx") || lower.endsWith(".doc")) return "DOCX";
+        if (lower.endsWith(".docx")) return "DOCX";
+        if (lower.endsWith(".doc")) return "DOC";
         if (lower.endsWith(".md") || lower.endsWith(".markdown")) return "MD";
         if (lower.endsWith(".txt")) return "TXT";
         return "UNKNOWN";
     }
+
+    private boolean isWordDocument(String fileType) {
+        return "DOCX".equals(fileType) || "DOC".equals(fileType);
+    }
+
+    private boolean hasPdfPreview(Document doc) {
+        return ("PDF".equals(doc.getFileType()) && StrUtil.isNotBlank(doc.getFileKey()))
+                || (isWordDocument(doc.getFileType()) && StrUtil.isNotBlank(doc.getPreviewFileKey()));
+    }
+
+    private String buildPreviewFilename(String originalName) {
+        String filename = StrUtil.blankToDefault(originalName, "document");
+        int dotIndex = filename.lastIndexOf('.');
+        String baseName = dotIndex >= 0 ? filename.substring(0, dotIndex) : filename;
+        return baseName + ".preview.pdf";
+    }
+
+    private String getOriginalFilename(Document doc) {
+        String fileKey = doc.getFileKey();
+        if (StrUtil.isNotBlank(fileKey)) {
+            int slashIndex = Math.max(fileKey.lastIndexOf('/'), fileKey.lastIndexOf('\\'));
+            return slashIndex >= 0 ? fileKey.substring(slashIndex + 1) : fileKey;
+        }
+
+        String title = StrUtil.blankToDefault(doc.getTitle(), "document");
+        String lower = title.toLowerCase();
+        if (lower.endsWith(".pdf") || lower.endsWith(".docx") || lower.endsWith(".doc")
+                || lower.endsWith(".md") || lower.endsWith(".markdown") || lower.endsWith(".txt")) {
+            return title;
+        }
+
+        return title + switch (doc.getFileType()) {
+            case "PDF" -> ".pdf";
+            case "DOCX" -> ".docx";
+            case "DOC" -> ".doc";
+            case "MD" -> ".md";
+            case "TXT" -> ".txt";
+            default -> ".txt";
+        };
+    }
+
+    private record PdfPageIndex(String normalizedText, List<Integer> pageByChar) {}
+
+    private record PageRange(Integer start, Integer end) {
+        boolean located() {
+            return start != null && end != null;
+        }
+    }
+
+    private record LocatedPageRange(Integer pageStart, Integer pageEnd, int normalizedStart) {}
 }

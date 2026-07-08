@@ -23,6 +23,9 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * RAG 问答服务实现
@@ -44,6 +47,9 @@ public class RagServiceImpl implements RagService {
 
     @Value("${rag.retrieval.top-k:3}")
     private int topK;
+
+    @Value("${rag.retrieval.min-score:0.55}")
+    private double minScore;
 
     @Value("${rag.conversation.max-history:10}")
     private int maxHistory;
@@ -109,7 +115,17 @@ public class RagServiceImpl implements RagService {
             }
 
             // 关键词加权重排序（向量分 + 关键词命中；使用改写后的查询做关键词提取）
-            List<VectorStore.Hit> hits = rerankByKeywordBoost(searchQuery, candidates, topK);
+            // 召回 2× topK，为后续文档多样性过滤留空间
+            List<VectorStore.Hit> reranked = rerankByKeywordBoost(searchQuery, candidates, topK * 2);
+
+            // 文档标题匹配加分：查询含"材料学院"→材料学院文档的 chunk 加分
+            List<VectorStore.Hit> boosted = boostByDocumentTitle(searchQuery, reranked);
+
+            // 文档多样性截断：每个文档最多贡献 3 个 chunk，防止单个文档霸榜
+            List<VectorStore.Hit> hits = applyDocumentDiversity(boosted, topK);
+
+            // 低分拦截：过滤相似度不达标的chunk，减少无关参考资料
+            hits = filterByMinScore(hits);
 
             // 缓存文档查询（buildUserPrompt + buildSources 各自遍历 hits，共用缓存避免重复查DB）
             Map<Long, Document> docCache = new HashMap<>();
@@ -319,5 +335,149 @@ public class RagServiceImpl implements RagService {
             }
         }
         return keywords;
+    }
+
+    /**
+     * 低分拦截：过滤相似度不达标的 chunk
+     * <p>
+     * 无关文档的 chunk 可能因词汇交集获得一定向量分（如 0.3~0.45），
+     * 但实际内容不相关。0.4 的阈值可有效过滤这类"虚高"结果。
+     */
+    private List<VectorStore.Hit> filterByMinScore(List<VectorStore.Hit> hits) {
+        if (hits.isEmpty()) return hits;
+        List<VectorStore.Hit> filtered = new ArrayList<>();
+        for (VectorStore.Hit hit : hits) {
+            if (hit.getScore() >= minScore) {
+                filtered.add(hit);
+            }
+        }
+        if (filtered.isEmpty()) {
+            // 全部被过滤时退回原始结果（避免无结果）
+            log.warn("所有chunk均低于最低分阈值({}), 退回原始结果", minScore);
+            return hits;
+        }
+        log.debug("低分过滤: {} → {} 个chunk (threshold={})", hits.size(), filtered.size(), minScore);
+        return filtered;
+    }
+
+    // ==================== 文档归属重排序 ====================
+
+    /**
+     * 从查询中提取机构/实体名称，用于文档标题匹配
+     * <p>
+     * 匹配模式: XX学院、XX系、XX部、XX处、XX中心、XX办公室 等常见校园机构名。
+     * 未匹配到时返回空列表，后续不加分。
+     */
+    private static final Pattern ENTITY_PATTERN = Pattern.compile(
+            "[\\u4e00-\\u9fa5]{2,6}(?:学院|大学|系|部|处|中心|办公室|委员会|基地|实验室|研究所|教研室)"
+    );
+
+    private List<String> extractEntityNames(String query) {
+        if (StrUtil.isBlank(query)) return Collections.emptyList();
+        List<String> entities = new ArrayList<>();
+        Matcher m = ENTITY_PATTERN.matcher(query);
+        while (m.find()) {
+            entities.add(m.group());
+        }
+        return entities;
+    }
+
+    /**
+     * 文档标题匹配加分
+     * <p>
+     * 问题："材料学院综测和软件学院一样吗" → 提取实体: [材料学院, 软件学院]
+     * → 材料学院综测.pdf 的 chunk +0.15，软件学院综测.pdf 的 chunk +0.10
+     * → 两个文档的 chunk 都排在前面，不相关的文档自然落后
+     * <p>
+     * 加分策略：第一个实体匹配 +0.15，后续实体逐次递减（语义上用户最先提到的通常最重要）
+     */
+    private List<VectorStore.Hit> boostByDocumentTitle(String query,
+                                                       List<VectorStore.Hit> candidates) {
+        List<String> entities = extractEntityNames(query);
+        if (entities.isEmpty() || candidates.isEmpty()) return candidates;
+
+        // 预加载所有 documentId → title 映射（避免重复查 DB）
+        Map<Long, String> titleCache = new HashMap<>();
+        for (VectorStore.Hit hit : candidates) {
+            Long docId = getDocId(hit);
+            if (docId != null && !titleCache.containsKey(docId)) {
+                Document doc = getDocumentById(docId);
+                if (doc != null) {
+                    titleCache.put(docId, doc.getTitle());
+                }
+            }
+        }
+
+        List<VectorStore.Hit> boosted = new ArrayList<>();
+        for (VectorStore.Hit hit : candidates) {
+            Long docId = getDocId(hit);
+            float bonus = 0f;
+
+            if (docId != null) {
+                String title = titleCache.get(docId);
+                if (title != null) {
+                    // 按实体顺序加权：第一个匹配的实体加分最高
+                    for (int i = 0; i < entities.size(); i++) {
+                        if (title.contains(entities.get(i))) {
+                            bonus = Math.max(bonus, 0.15f - i * 0.05f);
+                        }
+                    }
+                }
+            }
+            boosted.add(new VectorStore.Hit(hit.getChunkId(), hit.getScore() + bonus));
+        }
+
+        boosted.sort((a, b) -> Float.compare(b.getScore(), a.getScore()));
+        return boosted;
+    }
+
+    /**
+     * 文档多样性截断
+     * <p>
+     * 每个文档最多贡献 maxPerDoc 个 chunk，超出的丢弃，
+     * 用其他文档的 chunk 补位，确保检索结果覆盖多个文档。
+     * <p>
+     * 示例: 材料学院 chunk1-8（高分）→ 只保留 top 3，
+     * 第 4-8 个位置由其他文档（软件学院等）的 chunk 补充
+     */
+    private List<VectorStore.Hit> applyDocumentDiversity(List<VectorStore.Hit> candidates,
+                                                        int targetCount) {
+        final int maxPerDoc = 3;
+
+        List<VectorStore.Hit> result = new ArrayList<>();
+        List<VectorStore.Hit> overflow = new ArrayList<>();
+        Map<Long, Integer> docCounts = new HashMap<>();
+
+        for (VectorStore.Hit hit : candidates) {
+            Long docId = getDocId(hit);
+            if (docId == null) {
+                if (result.size() < targetCount) result.add(hit);
+                continue;
+            }
+
+            int count = docCounts.getOrDefault(docId, 0);
+            if (count < maxPerDoc) {
+                result.add(hit);
+                docCounts.put(docId, count + 1);
+            } else {
+                overflow.add(hit);
+            }
+        }
+
+        // 如果结果不足 targetCount，用 overflow 补齐
+        for (VectorStore.Hit hit : overflow) {
+            if (result.size() >= targetCount) break;
+            result.add(hit);
+        }
+
+        return result;
+    }
+
+    /**
+     * 从 Hit 获取所属文档 ID
+     */
+    private Long getDocId(VectorStore.Hit hit) {
+        DocumentChunk chunk = vectorStore.getChunk(hit.getChunkId());
+        return chunk != null ? chunk.getDocumentId() : null;
     }
 }

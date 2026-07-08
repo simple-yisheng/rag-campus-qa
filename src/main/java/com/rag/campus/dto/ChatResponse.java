@@ -37,8 +37,14 @@ public class ChatResponse {
         private Long documentId;
         /** 文档标题 */
         private String title;
+        /** 源文件类型：PDF / DOCX / TXT 等 */
+        private String fileType;
         /** chunk序号 */
         private Integer chunkIndex;
+        /** PDF 起始页码（1-based，非 PDF 或无法定位时为空） */
+        private Integer pageStart;
+        /** PDF 结束页码（1-based，非 PDF 或无法定位时为空） */
+        private Integer pageEnd;
         /** 相似度得分 */
         private Double score;
         /** chunk文本片段（前100字） */

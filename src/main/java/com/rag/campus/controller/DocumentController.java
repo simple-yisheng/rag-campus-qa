@@ -3,6 +3,7 @@ package com.rag.campus.controller;
 import com.rag.campus.common.Result;
 import com.rag.campus.dto.DocumentUploadResult;
 import com.rag.campus.entity.Document;
+import com.rag.campus.entity.DocumentChunk;
 import com.rag.campus.service.DocumentService;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
@@ -17,7 +18,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 文档管理接口
@@ -70,7 +73,9 @@ public class DocumentController {
      * 前端可通过 <iframe src="/api/documents/{id}/file"> 或新窗口打开预览。
      */
     @GetMapping("/{id}/file")
-    public void downloadFile(@PathVariable Long id, HttpServletResponse response) {
+    public void downloadFile(@PathVariable Long id,
+                             @RequestParam(value = "download", defaultValue = "false") boolean download,
+                             HttpServletResponse response) {
         Document doc = documentService.getById(id);
         if (doc == null) {
             response.setStatus(404);
@@ -101,7 +106,7 @@ public class DocumentController {
             String encodedName = URLEncoder.encode(doc.getTitle(), StandardCharsets.UTF_8)
                     .replace("+", "%20");
             // inline: PDF/图片在浏览器内预览；其他类型浏览器自行决定
-            String disposition = isInlinePreview(doc.getFileType())
+            String disposition = !download && isInlinePreview(doc.getFileType())
                     ? "inline"
                     : "attachment";
             response.setHeader(HttpHeaders.CONTENT_DISPOSITION,
@@ -115,6 +120,48 @@ public class DocumentController {
             out.flush();
         } catch (Exception e) {
             log.error("文件下载失败: documentId={}", id, e);
+            response.setStatus(500);
+        }
+    }
+
+    /**
+     * 获取 PDF 预览文件。
+     * <p>
+     * PDF 原文档直接返回原始 PDF；Word 文档返回 LibreOffice 生成的 PDF 预览。
+     */
+    @GetMapping("/{id}/preview")
+    public void previewFile(@PathVariable Long id, HttpServletResponse response) {
+        Document doc = documentService.getById(id);
+        if (doc == null) {
+            response.setStatus(404);
+            return;
+        }
+
+        InputStream stream = documentService.getPreviewFileStream(id);
+        if (stream == null) {
+            response.setStatus(404);
+            try {
+                response.setContentType("text/plain; charset=UTF-8");
+                response.getWriter().write("该文档暂无PDF预览文件");
+            } catch (IOException ignored) {}
+            return;
+        }
+
+        try (stream; OutputStream out = response.getOutputStream()) {
+            response.setContentType("application/pdf");
+            String encodedName = URLEncoder.encode(doc.getTitle() + ".pdf", StandardCharsets.UTF_8)
+                    .replace("+", "%20");
+            response.setHeader(HttpHeaders.CONTENT_DISPOSITION,
+                    "inline; filename*=UTF-8''" + encodedName);
+
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            while ((bytesRead = stream.read(buffer)) != -1) {
+                out.write(buffer, 0, bytesRead);
+            }
+            out.flush();
+        } catch (Exception e) {
+            log.error("预览文件读取失败: documentId={}", id, e);
             response.setStatus(500);
         }
     }
@@ -138,6 +185,41 @@ public class DocumentController {
             return Result.fail("文档不存在");
         }
         return Result.ok(doc);
+    }
+
+    /**
+     * 获取文档完整文本内容。
+     * <p>
+     * GET /api/documents/{id}/content
+     * <p>
+     * 用于前端参考资料定位：点击参考资料时侧边抽屉展示从原始文件提取的全文，
+     * 并使用 chunkIndex 对应的 chunk 文本在全文中定位高亮。
+     */
+    @GetMapping("/{id}/content")
+    public Result getContent(@PathVariable Long id) {
+        Document doc = documentService.getById(id);
+        if (doc == null) {
+            return Result.fail("文档不存在");
+        }
+        String content = documentService.getDocumentContent(id);
+        if (content == null) {
+            return Result.fail("文档内容为空，可能尚未处理完成");
+        }
+        List<DocumentChunk> chunks = documentService.getDocumentChunks(id);
+        Map<String, Object> data = new HashMap<>();
+        data.put("documentId", doc.getId());
+        data.put("title", doc.getTitle());
+        data.put("fileType", doc.getFileType());
+        data.put("content", content);
+        data.put("chunks", chunks.stream()
+                .map(chunk -> {
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("chunkIndex", chunk.getChunkIndex());
+                    item.put("text", chunk.getChunkText());
+                    return item;
+                })
+                .toList());
+        return Result.ok(data);
     }
 
     // ==================== 私有方法 ====================

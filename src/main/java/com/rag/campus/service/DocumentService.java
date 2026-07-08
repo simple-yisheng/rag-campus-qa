@@ -2,6 +2,7 @@ package com.rag.campus.service;
 
 import com.rag.campus.dto.DocumentUploadResult;
 import com.rag.campus.entity.Document;
+import com.rag.campus.entity.DocumentChunk;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.InputStream;
@@ -47,6 +48,13 @@ public interface DocumentService {
     InputStream getFileStream(Long documentId);
 
     /**
+     * 获取文档的 PDF 预览文件流。
+     * <p>
+     * PDF 文档直接返回原始文件流；Word 文档返回 LibreOffice 生成的 PDF 预览流。
+     */
+    InputStream getPreviewFileStream(Long documentId);
+
+    /**
      * 删除文档 — 同时删除关联 chunks、MinIO 文件、向量索引
      *
      * @param documentId 文档ID
@@ -61,4 +69,23 @@ public interface DocumentService {
      * @param documentId 文档ID
      */
     void processDocument(Long documentId);
+
+    /**
+     * 获取文档完整文本内容。
+     * <p>
+     * 优先从 MinIO 原始文件重新提取，保留比分块拼接更完整的文本结构；
+     * 老文档缺少原始文件时才回退到数据库原文或 chunks 拼接。
+     *
+     * @param documentId 文档ID
+     * @return 文档完整纯文本，文档不存在或无可用内容时返回 null
+     */
+    String getDocumentContent(Long documentId);
+
+    /**
+     * 获取文档 chunk 列表，按 chunkIndex 升序返回。
+     *
+     * @param documentId 文档 ID
+     * @return chunk 列表，文档不存在或尚无 chunk 时返回空列表
+     */
+    List<DocumentChunk> getDocumentChunks(Long documentId);
 }

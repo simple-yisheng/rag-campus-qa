@@ -6,4 +6,8 @@
 
 ALTER TABLE tb_document ADD COLUMN content_hash VARCHAR(32) DEFAULT NULL COMMENT '文件内容MD5哈希，用于去重';
 ALTER TABLE tb_document ADD COLUMN file_key VARCHAR(500) DEFAULT NULL COMMENT 'MinIO存储路径（原始文件）';
+ALTER TABLE tb_document ADD COLUMN preview_file_key VARCHAR(500) DEFAULT NULL COMMENT 'MinIO存储路径（PDF预览文件）';
 ALTER TABLE tb_document ADD INDEX idx_content_hash (content_hash);
+
+ALTER TABLE tb_document_chunk ADD COLUMN page_start INT DEFAULT NULL COMMENT 'PDF起始页码（1-based）';
+ALTER TABLE tb_document_chunk ADD COLUMN page_end INT DEFAULT NULL COMMENT 'PDF结束页码（1-based）';

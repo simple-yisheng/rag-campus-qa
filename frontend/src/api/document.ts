@@ -29,6 +29,24 @@ export async function deleteDocument(id: number): Promise<void> {
   await api.delete(`/documents/${id}`)
 }
 
+export interface DocumentContent {
+  documentId: number
+  title: string
+  fileType?: string
+  content: string
+  chunks: DocumentChunk[]
+}
+
+export interface DocumentChunk {
+  chunkIndex: number
+  text: string
+}
+
+export async function getDocumentContent(id: number): Promise<DocumentContent> {
+  const res = await api.get(`/documents/${id}/content`)
+  return res.data.data
+}
+
 export async function uploadDocument(
   file: File,
   category: string,

@@ -12,6 +12,7 @@
     "@tdesign-vue-next/chat": "^0.2.4",
     "axios": "^1.18.1",
     "marked": "^18.0.5",
+    "pdfjs-dist": "^4.10.38",
     "tdesign-vue-next": "^1.20.3",
     "vue": "^3.5.39",
     "vue-router": "^4.6.4"

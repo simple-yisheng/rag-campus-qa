@@ -3,6 +3,8 @@ import { ref, nextTick, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { ask, getHistory, type AskResponse } from '../api/chat'
+import { getDocumentContent, type DocumentContent } from '../api/document'
+import PdfViewer from '../components/PdfViewer.vue'
 import { marked } from 'marked'
 
 const router = useRouter()
@@ -143,10 +145,115 @@ function scrollToBottom() {
   })
 }
 
-// ========== 参考资料 ==========
-function viewSource(doc: { documentId: number; title: string }) {
-  window.open(`/api/documents/${doc.documentId}/file`)
+// ========== 参考资料抽屉 ==========
+const drawerVisible = ref(false)
+const drawerLoading = ref(false)
+const drawerDoc = ref<DocumentContent | null>(null)
+const drawerPdfSource = ref<AskResponse['sources'][number] | null>(null)
+const drawerMode = ref<'pdf' | 'text'>('text')
+const drawerHighlightSnippet = ref('')
+const drawerTargetChunkIndex = ref<number | null>(null)
+const drawerContentRef = ref<HTMLElement | null>(null)
+const drawerDocumentId = computed(() => drawerPdfSource.value?.documentId || drawerDoc.value?.documentId)
+
+async function viewSource(src: AskResponse['sources'][number]) {
+  drawerVisible.value = true
+  drawerLoading.value = true
+  drawerDoc.value = null
+  drawerPdfSource.value = null
+  drawerHighlightSnippet.value = src.snippet || ''
+  drawerTargetChunkIndex.value = typeof src.chunkIndex === 'number' ? src.chunkIndex : null
+
+  if ((src.fileType === 'PDF' || src.pageStart) && src.pageStart) {
+    drawerMode.value = 'pdf'
+    drawerPdfSource.value = src
+    drawerLoading.value = false
+    return
+  }
+
+  drawerMode.value = 'text'
+  try {
+    drawerDoc.value = await getDocumentContent(src.documentId)
+  } catch {
+    MessagePlugin.error('获取文档内容失败')
+    drawerVisible.value = false
+  } finally {
+    drawerLoading.value = false
+  }
+  if (drawerVisible.value && drawerDoc.value) {
+    await nextTick()
+    setTimeout(scrollToTargetChunk, 80)
+  }
 }
+
+function normalizeText(text: string): string {
+  return text.replace(/\s+/g, '')
+}
+
+function getTargetText(): string {
+  if (!drawerDoc.value) return drawerHighlightSnippet.value
+  if (drawerTargetChunkIndex.value !== null) {
+    const chunk = drawerDoc.value.chunks?.find(item => item.chunkIndex === drawerTargetChunkIndex.value)
+    if (chunk?.text) return chunk.text
+  }
+  return drawerHighlightSnippet.value
+}
+
+function findNormalizedRange(text: string, target: string): { start: number; end: number } | null {
+  const normalizedTarget = normalizeText(target)
+  if (normalizedTarget.length < 8) return null
+
+  let normalizedText = ''
+  const rawIndexes: number[] = []
+  for (let i = 0; i < text.length; i++) {
+    if (!/\s/.test(text[i])) {
+      normalizedText += text[i]
+      rawIndexes.push(i)
+    }
+  }
+
+  const candidates = [
+    normalizedTarget,
+    normalizedTarget.substring(0, 180),
+    normalizedTarget.substring(0, 120),
+    normalizedTarget.substring(0, 80),
+    normalizedTarget.substring(0, 40),
+    normalizedTarget.substring(0, 24),
+  ].filter(item => item.length >= 8)
+
+  for (const candidate of candidates) {
+    const normalizedStart = normalizedText.indexOf(candidate)
+    if (normalizedStart >= 0) {
+      const rawStart = rawIndexes[normalizedStart]
+      const rawEnd = rawIndexes[normalizedStart + candidate.length - 1] + 1
+      return { start: rawStart, end: rawEnd }
+    }
+  }
+
+  return null
+}
+
+const drawerContentSegments = computed(() => {
+  const content = drawerDoc.value?.content || ''
+  const range = findNormalizedRange(content, getTargetText())
+  if (!range) return [{ text: content, highlight: false }]
+  return [
+    { text: content.slice(0, range.start), highlight: false },
+    { text: content.slice(range.start, range.end), highlight: true },
+    { text: content.slice(range.end), highlight: false },
+  ].filter(segment => segment.text.length > 0)
+})
+
+function scrollToTargetChunk() {
+  const target = drawerContentRef.value?.querySelector('.source-hit')
+  target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
+function downloadDrawerDocument() {
+  if (!drawerDocumentId.value) return
+  window.open(`/api/documents/${drawerDocumentId.value}/file?download=true`, '_blank')
+}
+
 
 // ========== 工具 ==========
 function generateUUID(): string {
@@ -371,6 +478,56 @@ const suggestedQuestions = [
       </div>
     </div>
   </div>
+
+  <!-- ==================== 参考资料抽屉 ==================== -->
+  <t-drawer
+    v-model:visible="drawerVisible"
+    size="700px"
+    :footer="false"
+    :close-btn="true"
+  >
+    <template #header>
+      <div class="source-drawer-header">
+        <span class="source-drawer-title">{{ drawerPdfSource?.title || drawerDoc?.title || '文档内容' }}</span>
+        <t-button
+          v-if="drawerDocumentId"
+          size="small"
+          variant="outline"
+          @click="downloadDrawerDocument"
+        >
+          下载原文件
+        </t-button>
+      </div>
+    </template>
+
+    <t-loading :loading="drawerLoading" text="加载中...">
+      <PdfViewer
+        v-if="drawerMode === 'pdf' && drawerPdfSource && !drawerLoading"
+        :file-url="`/api/documents/${drawerPdfSource.documentId}/preview`"
+        :highlight-text="drawerPdfSource.snippet"
+        :initial-page="drawerPdfSource.pageStart"
+        :page-end="drawerPdfSource.pageEnd"
+      />
+
+      <div v-else-if="drawerDoc && !drawerLoading" ref="drawerContentRef" class="source-drawer-body">
+        <div class="source-drawer-meta">
+          <span>全文内容</span>
+          <span v-if="drawerTargetChunkIndex !== null">定位片段 #{{ drawerTargetChunkIndex + 1 }}</span>
+        </div>
+
+        <div v-if="drawerDoc.content" class="source-document-text">
+          <template v-for="(segment, index) in drawerContentSegments" :key="index">
+            <mark v-if="segment.highlight" class="source-hit">{{ segment.text }}</mark>
+            <span v-else>{{ segment.text }}</span>
+          </template>
+        </div>
+
+        <div v-else class="source-empty">
+          暂无可展示的全文内容
+        </div>
+      </div>
+    </t-loading>
+  </t-drawer>
 </template>
 
 <style scoped>
@@ -828,5 +985,67 @@ const suggestedQuestions = [
   .ds-msg-inner { padding: 0 12px; }
   .ds-input-bar { padding: 12px 12px 8px; }
   .ds-disclaimer { display: none; }
+}
+
+/* ==================== 参考资料抽屉 ==================== */
+.source-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+}
+
+.source-drawer-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.source-drawer-body {
+  max-height: calc(100vh - 112px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.source-drawer-meta {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0 12px;
+  margin-bottom: 8px;
+  background: #fff;
+  color: #888;
+  font-size: 12px;
+}
+
+.source-document-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #333;
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.source-hit {
+  display: inline;
+  padding: 2px 3px;
+  border-radius: 3px;
+  background: #fff1b8;
+  color: inherit;
+  box-shadow: 0 0 0 1px rgba(212, 136, 6, 0.22);
+}
+
+.source-empty {
+  padding: 48px 0;
+  color: #999;
+  text-align: center;
+  font-size: 14px;
 }
 </style>

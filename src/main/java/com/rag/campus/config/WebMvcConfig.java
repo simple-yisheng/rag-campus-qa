@@ -1,5 +1,9 @@
 package com.rag.campus.config;
 
+import org.springframework.boot.web.server.MimeMappings;
+import org.springframework.boot.web.server.WebServerFactoryCustomizer;
+import org.springframework.boot.web.servlet.server.ConfigurableServletWebServerFactory;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
@@ -34,5 +38,20 @@ public class WebMvcConfig implements WebMvcConfigurer {
                         return null;
                     }
                 });
+    }
+
+    /**
+     * 注册 .mjs MIME 类型（PDF.js worker 文件）
+     * <p>
+     * Spring Boot 默认不识别 .mjs 扩展名，导致 PDF.js worker 加载失败。
+     * 此配置让 Tomcat 将 .mjs 作为 text/javascript 返回。
+     */
+    @Bean
+    public WebServerFactoryCustomizer<ConfigurableServletWebServerFactory> mimeCustomizer() {
+        return factory -> {
+            MimeMappings mappings = new MimeMappings(MimeMappings.DEFAULT);
+            mappings.add("mjs", "text/javascript");
+            factory.setMimeMappings(mappings);
+        };
     }
 }

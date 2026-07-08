@@ -45,6 +45,9 @@ public class Document {
     /** MinIO存储路径（原始文件） */
     private String fileKey;
 
+    /** MinIO存储路径（PDF预览文件，PDF原文档可为空并直接使用fileKey） */
+    private String previewFileKey;
+
     /**
      * 处理状态：
      * PENDING    — 刚上传，等待处理

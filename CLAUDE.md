@@ -20,15 +20,17 @@ docker compose up -d        # MySQL 8.0:3306, Redis 7:6379, RabbitMQ 3.12:5672/1
 ## 核心架构
 
 ```
-上传:  MD5去重 → DocumentConverter(策略模式) → MySQL(PENDING) + MinIO(原始文件) → RabbitMQ → 异步处理
-异步:  DocumentChunker(4级自适应) → EmbeddingClient(≤10分批) → MySQL + VectorStore(内存)
-问答:  查询改写(多轮上下文) → Embedding → VectorStore.search(宽窗口) → 关键词加权重排 → DeepSeek生成 → MySQL+Redis持久化(仅存Q&A)
+上传:  MD5去重 → DocumentConverter(策略模式) → MySQL(PENDING) + MinIO(原始文件+PDF预览) → RabbitMQ → 异步处理
+异步:  DocumentChunker(4级自适应,表格感知) → 页码推断 → EmbeddingClient(≤10分批) → MySQL + VectorStore(内存)
+问答:  查询改写(多轮上下文) → Embedding → VectorStore.search(宽窗口) → 关键词加权 → 文档标题匹配 → 文档多样性截断 → DeepSeek生成 → MySQL+Redis持久化(瘦身Q&A)
 ```
 
 ### MinIO 对象存储
 
 - 原始文件存储: `MinioStorageService` — 上传时自动存入 `documents/{docId}/{filename}`
+- Word→PDF 预览: `OfficePreviewService` — 调用 LibreOffice headless 将 DOCX/DOC 转 PDF 存入 MinIO（previewFileKey），供前端 PDF.js 统一渲染
 - 下载接口: `GET /api/documents/{id}/file` — PDF 内联预览，其他格式触发下载（【已知问题】使用自增 ID 可被遍历访问，待改为随机 token）
+- 预览接口: `GET /api/documents/{id}/preview` — PDF 返回原始文件，Word 返回 LibreOffice 转换的 PDF（无预览时返回提示）
 - 管理控制台: `http://localhost:9001`（minioadmin/minioadmin）
 - MinIO 故障不影响检索流程（upload 中 try-catch 容错）
 - Docker 数据位置: `D:\Docker\DockerDesktopWSL\`
@@ -38,14 +40,21 @@ docker compose up -d        # MySQL 8.0:3306, Redis 7:6379, RabbitMQ 3.12:5672/1
 1. Markdown 标题切分 — 检测 `#`/`##`/`###` → chunkByMarkdown()
 2. Q&A 格式切分 — 检测 `Q1`/`Q2` 等 → chunkByQA()（自动跳过目录页）
 3. 中文结构切分 — POLICY/SCHOLARSHIP/ACADEMIC + "第X章" → chunkByStructure()（过滤总结句）
-4. 滑动窗口兜底 — 800字/块, 200字重叠
+4. 滑动窗口兜底 — 800字/块, 200字重叠，Markdown 表格感知：跨 chunk 自动补表头+分隔线
+
+### 页码推断
+
+- PDF 分块时按 chunk 文本反查 pdfbox 页面文字，确定每个 chunk 的 pageStart/pageEnd
+- 存入 tb_document_chunk.page_start / page_end，经 SourceInfo 返回前端
+- 前端 PdfViewer 通过 initialPage 属性直接跳转到参考页面
 
 ## 关键实现细节
 
 - **EmbeddingClient**: DashScope 兼容模式 API，单次最多10条，超限自动分批 + 200ms 延迟
 - **VectorStore**: ConcurrentHashMap 内存索引，启动时 @PostConstruct 从 DB 加载，余弦相似度遍历
-- **检索增强**: 宽窗口召回(topK×3) → 关键词加权(向量分 + 0.2×命中率) → 截断 topK=8
-- **DocumentConverter**: 策略模式，PdfBoxConverter(.pdf) + PlainTextConverter(.txt/.md) + DocxConverter(.docx/.doc，表格→Markdown表格)，预留 MarkItDownConverter
+- **检索增强**: 宽窗口召回(topK×3) → 关键词加权(向量分 + 0.2×命中率) → 文档标题实体匹配加分(如查询含"材料学院"→材料学院文档chunk+0.15) → 文档多样性截断(每文档≤3 chunk) → 截断 topK=12
+- **DocumentConverter**: 策略模式，PdfBoxConverter(.pdf，坐标分析表格检测→Markdown表格输出，不覆盖writeString保留下标处理) + PlainTextConverter(.txt/.md) + DocxConverter(.docx/.doc，表格→Markdown表格)，预留 MarkItDownConverter
+- **OfficePreviewService**: Word文档上传时调用 LibreOffice headless 转 PDF，存入 MinIO 供前端 PDF.js 统一渲染
 - **DocxConverter**: 遍历 XWPFDocument.bodyElements，段落保留原文，表格格式化为 Markdown 表格（管道符+分隔线），避免表格结构丢失导致分块截断
 - **MD5 去重**: 上传时计算文件字节 MD5，查询 content_hash 列，已存在且 status=DONE 则拦截返回
 - **MinIO 存储**: 上传时自动存入原始文件，`GET /api/documents/{id}/file` 下载预览，MinIO 故障不影响检索
@@ -53,6 +62,8 @@ docker compose up -d        # MySQL 8.0:3306, Redis 7:6379, RabbitMQ 3.12:5672/1
 - **文档缓存**: RagServiceImpl 请求级 HashMap，避免 buildUserPrompt + buildSources 重复查 DB（16次→1次）
 - **content 字段**: 处理完成后清空，原文从 tb_document_chunk 拼接还原，避免大字段拖慢列表查询
 - **多轮对话**: Redis `rag:conversation:{sessionId}` 存储瘦身 Q&A（仅原始问答，去 system prompt 和 chunk），24h TTL；查询改写：追问先结合上文经 LLM 改写为独立完整查询，再向量化检索
+- **参考资料定位**: GET /api/documents/{id}/content 从 chunks 拼接全文；前端点击参考资料→侧边抽屉(t-drawer)展示，PDF 用 PdfViewer(PDF.js)渲染+页码定位+文字高亮，Word 用 LibreOffice 转 PDF 预览，无预览时降级为纯文本模式+chunk高亮
+- **PdfViewer 组件**: 基于 pdfjs-dist v4，支持 DPR 高清渲染、页码定位(initialPage/pageEnd)、范围渲染(renderRadius)、缩放、文字层高亮匹配
 - **桥接方法**: getDocumentById(Long) 解决 MyBatis-Plus selectById(Serializable) 无法匹配 Function<Long, Document> 的问题
 
 ## 安全
@@ -76,7 +87,10 @@ rag.conversation.ttl-hours: 24
 | 日期 | 任务 |
 |------|------|
 | 2026-07-08 | 多轮对话上下文能力 — ① 历史记录瘦身：Redis 只存原始 Q&A，去 system prompt、去 chunk；② 查询改写：追问先结合上文 LLM 改写为独立查询再检索 |
-| 2026-07-08 | 表格分块修复 — ① chunkBySlidingWindow 表格感知：跨 chunk 自动补表头+分隔线；② PdfBoxConverter 表格检测：坐标分析→Markdown表格输出 |
+| 2026-07-08 | 表格分块修复 — ① chunkBySlidingWindow 表格感知：跨 chunk 自动补表头+分隔线；② PdfBoxConverter 重写：不覆盖 writeString 保留下标处理，仅用 processTextPosition 收集坐标做表格检测 |
+| 2026-07-08 | 检索增强优化 — ① boostByDocumentTitle：实体匹配文档标题加分（查"材料学院"→材料学院文档+0.15）；② applyDocumentDiversity：每文档≤3 chunk 防单文档霸榜 |
+| 2026-07-08 | 参考资料定位升级 — ① PDF 页码推断(pageStart/pageEnd)→chunk→SourceInfo→前端；② Word→PDF 预览(LibreOffice)；③ 前端 PdfViewer 组件(PDF.js渲染+页码定位+文字高亮)；④ GET /api/documents/{id}/content + /preview 接口；⑤ 纯文本降级模式 |
+| 2026-07-08 | 前端 Markdown 渲染升级 — 手写正则→marked 库，支持表格/代码块等完整 GFM |
 | 2026-07-07 | DOCX/DOC 文件支持（Apache POI，表格→Markdown表格保留结构） |
 | 2026-07-07 | MinIO 对象存储（原始文件保存+下载预览） |
 | 2026-07-07 | MD5 去重（相同文件拦截重复上传） |
@@ -88,7 +102,6 @@ rag.conversation.ttl-hours: 24
 
 | 优先级 | 任务 | 说明 |
 |--------|------|------|
-| **P1** | **参考资料定位** | 点击参考资料 → 侧边抽屉展示文档完整纯文本 + 高亮定位到对应 chunk；新增 `GET /api/documents/{id}/content` |
 | P2 | 对话标题重命名 | 左侧会话列表支持双击/右键重命名 |
 | P2 | sessionId 缩短 | 当前 UUID 偏长，改用短 ID（如 6 位字母数字） |
 | P2 | 文件访问 URL 安全 | `GET /api/documents/{id}/file` 改为使用随机 token，避免用户遍历 ID 访问他人文件 |

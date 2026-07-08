@@ -126,7 +126,10 @@ public class RagPromptTemplate {
                 bestPerDoc.put(docId, ChatResponse.SourceInfo.builder()
                         .documentId(docId)
                         .title(doc != null ? doc.getTitle() : "未知")
+                        .fileType(doc != null ? doc.getFileType() : null)
                         .chunkIndex(chunk.getChunkIndex())
+                        .pageStart(chunk.getPageStart())
+                        .pageEnd(chunk.getPageEnd())
                         .score((double) hit.getScore())
                         .snippet(snippet)
                         .build());
