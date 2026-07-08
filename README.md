@@ -219,7 +219,7 @@ Redis: `rag:conversation:{sessionId}` → 瘦身 Q&A 数组（仅原始问答，
 
 ## 面试要点
 
-该项目是**黑马点评**的技术延续（Redis 缓存、RabbitMQ 异步、MyBatis-Plus CRUD 为同一技术栈），适合在面试中展示以下亮点：
+该项目使用传统后端技术（Redis 缓存、RabbitMQ 异步、MyBatis-Plus CRUD 为同一技术栈），适合在面试中展示以下亮点：
 
 1. **RAG 全链路**：问题 → 查询改写 → Embedding → 余弦相似度检索 → 关键词加权 → 文档归属匹配 → 多样性截断 → 低分拦截 → Prompt 组装 → LLM 生成 → 瘦身持久化
 2. **DocumentConverter 策略模式**：新增格式只需添加实现类，Spring 自动注入，符合开闭原则
