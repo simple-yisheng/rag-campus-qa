@@ -200,6 +200,25 @@ public class DocumentServiceImpl implements DocumentService {
 
     @Override
     @Transactional
+    public void delete(Long documentId) {
+        Document doc = documentMapper.selectById(documentId);
+        if (doc == null) return;
+
+        // 删除 MinIO 文件
+        if (StrUtil.isNotBlank(doc.getFileKey())) {
+            minioStorage.delete(doc.getFileKey());
+        }
+
+        // 删除向量索引
+        vectorStore.removeByDocumentId(documentId);
+
+        // DB 删除（chunks 通过 CASCADE 自动删除）
+        documentMapper.deleteById(documentId);
+        log.info("文档已删除: id={}, title={}", documentId, doc.getTitle());
+    }
+
+    @Override
+    @Transactional
     public void processDocument(Long documentId) {
         Document doc = documentMapper.selectById(documentId);
         if (doc == null) {

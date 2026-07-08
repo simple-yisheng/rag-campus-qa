@@ -47,6 +47,13 @@ public interface DocumentService {
     InputStream getFileStream(Long documentId);
 
     /**
+     * 删除文档 — 同时删除关联 chunks、MinIO 文件、向量索引
+     *
+     * @param documentId 文档ID
+     */
+    void delete(Long documentId);
+
+    /**
      * 处理文档 — 分块 + 向量化 + 写入向量索引
      * <p>
      * 此方法由MQ消费者调用

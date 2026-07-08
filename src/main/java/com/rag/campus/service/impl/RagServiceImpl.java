@@ -72,8 +72,23 @@ public class RagServiceImpl implements RagService {
         log.info("RAG问答开始: sessionId={}, question={}", sessionId, question);
 
         try {
-            // === Step 1: 问题向量化 ===
-            float[] questionVector = embeddingClient.embed(question);
+            // === Step 1: 查询改写（多轮对话上下文补全） ===
+            // 先加载瘦身历史（仅原始Q&A），用于查询改写和后续消息组装
+            List<Map<String, String>> slimHistory = loadConversationHistory(sessionId);
+
+            // 如果有历史，对当前追问做改写，补全省略的主语/指代
+            String searchQuery = question;
+            if (!slimHistory.isEmpty()) {
+                String rewritePrompt = RagPromptTemplate.buildRewritePrompt(slimHistory, question);
+                String rewritten = deepSeekClient.rewriteQuery(rewritePrompt);
+                if (StrUtil.isNotBlank(rewritten) && !rewritten.equals(question)) {
+                    log.info("查询改写: {} -> {}", question, rewritten);
+                    searchQuery = rewritten;
+                }
+            }
+
+            // === Step 2: 问题向量化（使用改写后的查询） ===
+            float[] questionVector = embeddingClient.embed(searchQuery);
             if (questionVector.length == 0) {
                 return ChatResponse.builder()
                         .sessionId(sessionId)
@@ -82,7 +97,7 @@ public class RagServiceImpl implements RagService {
                         .build();
             }
 
-            // === Step 2: 语义检索（先用大窗口召回，再关键词加权，最后截断） ===
+            // === Step 3: 语义检索（先用大窗口召回，再关键词加权，最后截断） ===
             int candidateSize = Math.min(topK * 3, vectorStore.size());
             List<VectorStore.Hit> candidates = vectorStore.search(questionVector, candidateSize);
             if (candidates.isEmpty()) {
@@ -93,41 +108,43 @@ public class RagServiceImpl implements RagService {
                         .build();
             }
 
-            // 关键词加权重排序（向量分 + 关键词命中）
-            List<VectorStore.Hit> hits = rerankByKeywordBoost(question, candidates, topK);
+            // 关键词加权重排序（向量分 + 关键词命中；使用改写后的查询做关键词提取）
+            List<VectorStore.Hit> hits = rerankByKeywordBoost(searchQuery, candidates, topK);
 
             // 缓存文档查询（buildUserPrompt + buildSources 各自遍历 hits，共用缓存避免重复查DB）
             Map<Long, Document> docCache = new HashMap<>();
             java.util.function.Function<Long, Document> cachedDocResolver = id ->
                     docCache.computeIfAbsent(id, this::getDocumentById);
 
-            // === Step 3: 构建 Prompt ===
+            // === Step 4: 构建 Prompt ===
+            // system prompt 每轮新鲜生成，不存 Redis
             String systemPrompt = RagPromptTemplate.buildSystemPrompt();
+            // user prompt 携带当前轮的 chunk 上下文 + 用户原始问题
             String userPrompt = RagPromptTemplate.buildUserPrompt(
                     question, hits,
                     vectorStore::getChunk,
                     cachedDocResolver
             );
 
-            // === Step 4: 加载对话历史（多轮对话） ===
-            List<Map<String, String>> messages = loadConversationHistory(sessionId);
-            if (messages.isEmpty()) {
-                messages.add(Map.of("role", "system", "content", systemPrompt));
-            }
+            // === Step 5: 组装消息列表 ===
+            // 结构: [system(fresh)] + [瘦身历史(仅原始Q&A)] + [当前user(含chunk)]
+            List<Map<String, String>> messages = new ArrayList<>();
+            messages.add(Map.of("role", "system", "content", systemPrompt));
+            messages.addAll(slimHistory);               // 历史只含原始Q&A，无chunk
             messages.add(Map.of("role", "user", "content", userPrompt));
 
-            // === Step 5: 调用 LLM 生成回答 ===
+            // === Step 6: 调用 LLM 生成回答 ===
             String answer = deepSeekClient.chatWithHistory(messages);
 
-            // === Step 6: 构建引用来源 ===
+            // === Step 7: 构建引用来源 ===
             List<ChatResponse.SourceInfo> sources = RagPromptTemplate.buildSources(
                     hits, vectorStore::getChunk, cachedDocResolver
             );
 
-            // === Step 7: 保存对话历史到 Redis ===
-            saveConversationHistory(sessionId, messages, answer);
+            // === Step 8: 保存瘦身对话历史到 Redis（仅原始Q&A） ===
+            saveConversationHistory(sessionId, slimHistory, question, answer);
 
-            // === Step 8: 持久化到 MySQL ===
+            // === Step 9: 持久化到 MySQL ===
             Conversation conversation = new Conversation();
             conversation.setSessionId(sessionId);
             conversation.setQuestion(question);
@@ -136,7 +153,7 @@ public class RagServiceImpl implements RagService {
             conversation.setCreateTime(LocalDateTime.now());
             conversationMapper.insert(conversation);
 
-            log.info("RAG问答完成: sessionId={}, hits={}", sessionId, hits.size());
+            log.info("RAG问答完成: sessionId={}, searchQuery={}, hits={}", sessionId, searchQuery, hits.size());
 
             return ChatResponse.builder()
                     .sessionId(sessionId)
@@ -157,7 +174,10 @@ public class RagServiceImpl implements RagService {
     // ==================== 对话历史管理（Redis） ====================
 
     /**
-     * 从Redis加载最近N轮对话历史
+     * 从Redis加载最近N轮对话历史（瘦身格式：仅原始Q&A，不含system prompt和chunk）
+     * <p>
+     * 兼容处理：如果检测到旧格式（首条消息 role=system），说明是旧版本残留，
+     * 直接返回空列表开始新对话，旧 key 会在 TTL 后自然过期。
      */
     private List<Map<String, String>> loadConversationHistory(String sessionId) {
         String key = CONVERSATION_HISTORY_PREFIX + sessionId;
@@ -167,13 +187,19 @@ public class RagServiceImpl implements RagService {
         }
 
         try {
-            // 存储格式: [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}, ...]
             List<Map<String, String>> history = JSONUtil.toList(json, Map.class)
                     .stream()
                     .map(m -> (Map<String, String>) m)
                     .collect(java.util.stream.Collectors.toList());
 
-            // 只保留最近 maxHistory 轮（一轮 = user + assistant）
+            // 兼容旧格式：旧版本首条是 system prompt，检测到则丢弃，开始新对话
+            if (!history.isEmpty() && "system".equals(history.get(0).get("role"))) {
+                log.info("检测到旧格式对话历史(sessionId={})，将开始新对话", sessionId);
+                redisTemplate.delete(key);
+                return new ArrayList<>();
+            }
+
+            // 只保留最近 maxHistory 轮（一轮 = user + assistant 两条）
             int maxMessages = maxHistory * 2;
             if (history.size() > maxMessages) {
                 return history.subList(history.size() - maxMessages, history.size());
@@ -186,13 +212,18 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
-     * 保存本轮对话到Redis
+     * 保存本轮对话到Redis（瘦身格式：仅原始Q&A，不含system prompt和chunk）
+     * <p>
+     * 存储格式: [{"role":"user","content":"原始问题"}, {"role":"assistant","content":"回答"}, ...]
+     * 不再存储 system prompt 和带 chunk 的 RAG user prompt，避免历史膨胀和旧 chunk 干扰。
      */
     private void saveConversationHistory(String sessionId,
-                                         List<Map<String, String>> messages,
+                                         List<Map<String, String>> slimHistory,
+                                         String question,
                                          String answer) {
-        // 追加本轮 user 和 assistant
-        List<Map<String, String>> toSave = new ArrayList<>(messages);
+        // 追加本轮原始 Q&A（不含 chunk）
+        List<Map<String, String>> toSave = new ArrayList<>(slimHistory);
+        toSave.add(Map.of("role", "user", "content", question));
         toSave.add(Map.of("role", "assistant", "content", answer));
 
         String key = CONVERSATION_HISTORY_PREFIX + sessionId;

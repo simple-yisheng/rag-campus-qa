@@ -134,6 +134,25 @@ public class VectorStore {
     }
 
     /**
+     * 按文档ID移除所有关联的向量（删除文档时调用）
+     */
+    public void removeByDocumentId(Long documentId) {
+        List<Long> toRemove = new ArrayList<>();
+        for (Map.Entry<Long, DocumentChunk> entry : chunkCache.entrySet()) {
+            if (documentId.equals(entry.getValue().getDocumentId())) {
+                toRemove.add(entry.getKey());
+            }
+        }
+        for (Long chunkId : toRemove) {
+            vectorIndex.remove(chunkId);
+            chunkCache.remove(chunkId);
+        }
+        if (!toRemove.isEmpty()) {
+            log.info("向量索引移除文档[id={}]的 {} 条chunk", documentId, toRemove.size());
+        }
+    }
+
+    /**
      * 清空并重载（用于调试）
      */
     public void reload() {

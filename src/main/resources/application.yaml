@@ -72,7 +72,7 @@ rag:
     size: 800            # 每个chunk最大字符数（中文政策文档建议800-1000）
     overlap: 200         # 相邻chunk重叠字符数（size的25%）
   retrieval:
-    top-k: 8             # 检索返回的最相关chunk数
+    top-k: 12            # 检索返回的最相关chunk数（长文档/表格密集场景需更大窗口）
   conversation:
     max-history: 10      # Redis中保留的最近对话轮数
     ttl-hours: 24        # 对话过期时间（小时）

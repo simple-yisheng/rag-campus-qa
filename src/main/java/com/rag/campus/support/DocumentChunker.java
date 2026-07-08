@@ -308,8 +308,17 @@ public class DocumentChunker {
         return chunks;
     }
 
-    // ==================== 策略三：滑动窗口（兜底） ====================
+    // ==================== 策略三：滑动窗口（兜底，Markdown 表格感知） ====================
 
+    /**
+     * 滑动窗口分块，支持 Markdown 表格感知。
+     * <p>
+     * 当表格跨 chunk 拆分时，新 chunk 开头自动补回表头行 + 分隔线，
+     * 确保每个 chunk 中的表格数据行都自带列名上下文。
+     * <p>
+     * 表格识别规则：以 | 开头且以 | 结尾的行视为表格行；
+     * 第一行 = 表头，紧跟的 |---| 行 = 分隔线。
+     */
     private List<String> chunkBySlidingWindow(String text) {
         List<String> chunks = new ArrayList<>();
         if (text == null || text.isEmpty()) return chunks;
@@ -317,26 +326,75 @@ public class DocumentChunker {
         String[] paragraphs = text.split("\n");
         StringBuilder currentChunk = new StringBuilder();
 
+        // 表格状态追踪
+        String pendingHeader = null;   // 候选表头行，等待分隔线确认
+        String tableHeader = null;     // 已确认的"表头\n分隔线"，用于跨 chunk 补偿
+        boolean inTable = false;       // 当前是否在表格数据区内
+
         for (String paragraph : paragraphs) {
             String trimmed = paragraph.trim();
-            if (trimmed.isEmpty()) continue;
 
+            // 空行结束表格上下文
+            if (trimmed.isEmpty()) {
+                pendingHeader = null;
+                tableHeader = null;
+                inTable = false;
+                continue;
+            }
+
+            // 检测 Markdown 表格行
+            boolean isTableLine = trimmed.startsWith("|") && trimmed.endsWith("|");
+            boolean isSeparator = isTableLine && trimmed.contains("---");
+
+            // 表格状态机
+            if (isTableLine) {
+                if (isSeparator && pendingHeader != null) {
+                    // 确认表格：pendingHeader 是表头，当前行是分隔线
+                    tableHeader = pendingHeader + "\n" + trimmed;
+                    pendingHeader = null;
+                    inTable = true;
+                } else if (!isSeparator && !inTable) {
+                    // 候选表头（等待下一行分隔线确认）
+                    pendingHeader = trimmed;
+                }
+            } else {
+                // 非表格行，重置状态
+                pendingHeader = null;
+                tableHeader = null;
+                inTable = false;
+            }
+
+            // --- 添加到当前 chunk ---
             if (currentChunk.length() + trimmed.length() <= chunkSize) {
                 if (currentChunk.length() > 0) currentChunk.append("\n");
                 currentChunk.append(trimmed);
             } else {
+                // 当前 chunk 已满，保存并开启新 chunk
                 if (currentChunk.length() > 0) {
                     chunks.add(currentChunk.toString());
-                    String prevText = currentChunk.toString();
-                    currentChunk = new StringBuilder(
-                            prevText.length() > overlap
-                                    ? prevText.substring(prevText.length() - overlap)
-                                    : "");
+
+                    StringBuilder newChunk = new StringBuilder();
+
+                    // ★ 关键：如果新 chunk 从表格数据行开始，补回表头上下文
+                    if (inTable && isTableLine && !isSeparator && tableHeader != null) {
+                        newChunk.append(tableHeader).append("\n");
+                    } else {
+                        // 普通文本：使用字符级重叠防止信息丢失
+                        String prevText = currentChunk.toString();
+                        if (prevText.length() > overlap) {
+                            newChunk.append(prevText.substring(prevText.length() - overlap));
+                        }
+                    }
+
+                    currentChunk = newChunk;
                 }
+
+                // 超长段落处理
                 if (trimmed.length() > chunkSize) {
                     chunks.addAll(splitLongParagraph(trimmed));
                     currentChunk = new StringBuilder();
                 } else {
+                    if (currentChunk.length() > 0) currentChunk.append("\n");
                     currentChunk.append(trimmed);
                 }
             }

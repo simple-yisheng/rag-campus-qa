@@ -12,6 +12,7 @@ import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URLEncoder;
@@ -52,6 +53,15 @@ public class DocumentController {
     }
 
     /**
+     * 删除文档
+     */
+    @DeleteMapping("/{id}")
+    public Result delete(@PathVariable Long id) {
+        documentService.delete(id);
+        return Result.ok(null);
+    }
+
+    /**
      * 下载/预览文档原始文件
      * <p>
      * GET /api/documents/{id}/file
@@ -69,7 +79,16 @@ public class DocumentController {
 
         InputStream stream = documentService.getFileStream(id);
         if (stream == null) {
-            response.setStatus(404);
+            // 老文档未存储原始文件，返回提示页面
+            try {
+                response.setContentType("text/html; charset=UTF-8");
+                response.getWriter().write("""
+                    <html><head><meta charset="UTF-8"></head><body style="padding:40px;font-family:sans-serif">
+                    <h3>该文档暂无原始文件</h3>
+                    <p>原因：此文档上传时尚未启用 MinIO 对象存储，原始文件未保留。</p>
+                    <p>建议：重新上传该文件即可保存原始版本。</p>
+                    </body></html>""");
+            } catch (IOException ignored) {}
             return;
         }
 

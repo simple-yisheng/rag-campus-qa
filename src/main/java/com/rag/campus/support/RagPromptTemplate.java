@@ -4,8 +4,7 @@ import com.rag.campus.dto.ChatResponse;
 import com.rag.campus.entity.Document;
 import com.rag.campus.entity.DocumentChunk;
 
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 import java.util.stream.Collectors;
 
 /**
@@ -74,6 +73,33 @@ public class RagPromptTemplate {
     }
 
     /**
+     * 构建查询改写的 User Prompt
+     * <p>
+     * 将多轮对话中的追问（如"那第三章呢""在第几页"）改写为独立完整的查询，
+     * 使其脱离上下文后仍能被正确理解和检索。
+     *
+     * @param history         最近N轮对话的原始Q&A（不含chunk）
+     * @param currentQuestion 用户当前追问
+     * @return 查询改写 prompt
+     */
+    public static String buildRewritePrompt(List<Map<String, String>> history,
+                                            String currentQuestion) {
+        StringBuilder historyBuilder = new StringBuilder();
+        for (int i = 0; i < history.size(); i++) {
+            Map<String, String> msg = history.get(i);
+            String role = "user".equals(msg.get("role")) ? "用户" : "助手";
+            historyBuilder.append(role).append("：").append(msg.get("content")).append("\n");
+        }
+
+        return historyBuilder.toString()
+               + "用户：" + currentQuestion + "\n\n"
+               + "请将上面用户最后一句追问改写为一个独立、完整的问题，使其脱离上下文也能被正确理解和检索。"
+               + "改写时需要补全省略的主语、指代（如'它''这个''那'）、隐含的文档/章节引用等。"
+               + "如果用户的问题本身已经完整独立，直接返回原句。"
+               + "\n\n只输出改写后的问题，不要加任何解释或前缀。";
+    }
+
+    /**
      * 从检索结果构建 SourceInfo 列表
      */
     public static List<ChatResponse.SourceInfo> buildSources(
@@ -81,24 +107,32 @@ public class RagPromptTemplate {
             java.util.function.Function<Long, DocumentChunk> chunkResolver,
             java.util.function.Function<Long, Document> documentResolver) {
 
-        return hits.stream().map(hit -> {
+        // 按 documentId 去重，每篇文档只保留最高分的 chunk
+        Map<Long, ChatResponse.SourceInfo> bestPerDoc = new LinkedHashMap<>();
+
+        for (VectorStore.Hit hit : hits) {
             DocumentChunk chunk = chunkResolver.apply(hit.getChunkId());
-            if (chunk == null) return null;
+            if (chunk == null) continue;
 
             Document doc = documentResolver.apply(chunk.getDocumentId());
+            Long docId = chunk.getDocumentId();
 
-            String snippet = chunk.getChunkText();
-            if (snippet.length() > 100) {
-                snippet = snippet.substring(0, 100) + "...";
+            // 同文档只保留最高分
+            if (!bestPerDoc.containsKey(docId) || hit.getScore() > bestPerDoc.get(docId).getScore()) {
+                String snippet = chunk.getChunkText();
+                if (snippet.length() > 100) {
+                    snippet = snippet.substring(0, 100) + "...";
+                }
+                bestPerDoc.put(docId, ChatResponse.SourceInfo.builder()
+                        .documentId(docId)
+                        .title(doc != null ? doc.getTitle() : "未知")
+                        .chunkIndex(chunk.getChunkIndex())
+                        .score((double) hit.getScore())
+                        .snippet(snippet)
+                        .build());
             }
+        }
 
-            return ChatResponse.SourceInfo.builder()
-                    .documentId(chunk.getDocumentId())
-                    .title(doc != null ? doc.getTitle() : "未知")
-                    .chunkIndex(chunk.getChunkIndex())
-                    .score((double) hit.getScore())
-                    .snippet(snippet)
-                    .build();
-        }).filter(Objects::nonNull).collect(Collectors.toList());
+        return new ArrayList<>(bestPerDoc.values());
     }
 }
