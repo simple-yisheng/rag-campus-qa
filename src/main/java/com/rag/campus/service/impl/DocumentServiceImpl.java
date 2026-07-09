@@ -11,6 +11,7 @@ import com.rag.campus.entity.DocumentChunk;
 import com.rag.campus.mapper.DocumentChunkMapper;
 import com.rag.campus.mapper.DocumentMapper;
 import com.rag.campus.service.DocumentService;
+import com.rag.campus.service.UserService;
 import com.rag.campus.support.DocumentChunker;
 import com.rag.campus.support.DocumentConverter;
 import com.rag.campus.support.MinioStorageService;
@@ -50,6 +51,7 @@ public class DocumentServiceImpl implements DocumentService {
     private final List<DocumentConverter> converters;
     private final MinioStorageService minioStorage;
     private final OfficePreviewService officePreviewService;
+    private final UserService userService;
 
     /** 扩展名 → 转换器映射（启动时构建） */
     private final Map<String, DocumentConverter> converterMap = new HashMap<>();
@@ -74,7 +76,8 @@ public class DocumentServiceImpl implements DocumentService {
                                RabbitTemplate rabbitTemplate,
                                List<DocumentConverter> converters,
                                MinioStorageService minioStorage,
-                               OfficePreviewService officePreviewService) {
+                               OfficePreviewService officePreviewService,
+                               UserService userService) {
         this.documentMapper = documentMapper;
         this.chunkMapper = chunkMapper;
         this.embeddingClient = embeddingClient;
@@ -83,6 +86,7 @@ public class DocumentServiceImpl implements DocumentService {
         this.converters = converters;
         this.minioStorage = minioStorage;
         this.officePreviewService = officePreviewService;
+        this.userService = userService;
     }
 
     /** 构建扩展名 → 转换器映射 */
@@ -159,6 +163,8 @@ public class DocumentServiceImpl implements DocumentService {
         doc.setContentHash(md5);
         doc.setStatus("PENDING");
         doc.setChunkCount(0);
+        doc.setUploaderId(getCurrentUserId());
+        doc.setReviewStatus("APPROVED");
         doc.setCreateTime(LocalDateTime.now());
         documentMapper.insert(doc);
 
@@ -201,10 +207,16 @@ public class DocumentServiceImpl implements DocumentService {
 
     @Override
     public List<Document> listAll() {
-        return documentMapper.selectList(
-                new LambdaQueryWrapper<Document>()
-                        .orderByDesc(Document::getCreateTime)
-        );
+        LambdaQueryWrapper<Document> wrapper = new LambdaQueryWrapper<Document>()
+                .orderByDesc(Document::getCreateTime);
+
+        // 普通用户只能看到自己上传的文档，管理员看全部
+        com.rag.campus.entity.User currentUser = userService.getCurrentUser();
+        if (currentUser != null && !"ADMIN".equals(currentUser.getRole())) {
+            wrapper.eq(Document::getUploaderId, currentUser.getId());
+        }
+
+        return documentMapper.selectList(wrapper);
     }
 
     @Override
@@ -241,6 +253,14 @@ public class DocumentServiceImpl implements DocumentService {
     public void delete(Long documentId) {
         Document doc = documentMapper.selectById(documentId);
         if (doc == null) return;
+
+        // 权限检查：普通用户只能删除自己上传的文档
+        com.rag.campus.entity.User currentUser = userService.getCurrentUser();
+        if (currentUser != null && !"ADMIN".equals(currentUser.getRole())
+                && doc.getUploaderId() != null
+                && !doc.getUploaderId().equals(currentUser.getId())) {
+            throw new IllegalArgumentException("无权删除该文档");
+        }
 
         // 删除 MinIO 文件
         if (StrUtil.isNotBlank(doc.getFileKey())) {
@@ -570,6 +590,11 @@ public class DocumentServiceImpl implements DocumentService {
             case "TXT" -> ".txt";
             default -> ".txt";
         };
+    }
+
+    private Long getCurrentUserId() {
+        com.rag.campus.entity.User user = userService.getCurrentUser();
+        return user != null ? user.getId() : null;
     }
 
     private record PdfPageIndex(String normalizedText, List<Integer> pageByChar) {}

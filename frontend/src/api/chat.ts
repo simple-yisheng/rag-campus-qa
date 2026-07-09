@@ -1,6 +1,4 @@
-import axios from 'axios'
-
-const api = axios.create({ baseURL: '/api' })
+import api from './index'
 
 export interface SourceInfo {
   documentId: number
@@ -17,6 +15,18 @@ export interface AskResponse {
   sessionId: string
   answer: string
   sources: SourceInfo[]
+}
+
+export interface SessionInfo {
+  sessionId: string
+  title: string
+  createTime: string
+  lastTime: string
+}
+
+export async function getSessions(): Promise<SessionInfo[]> {
+  const res = await api.get('/chat/sessions')
+  return res.data.data || []
 }
 
 export async function ask(sessionId: string, question: string): Promise<AskResponse> {

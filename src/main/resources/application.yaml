@@ -85,3 +85,8 @@ rag:
   conversation:
     max-history: 10      # Redis中保留的最近对话轮数
     ttl-hours: 24        # 对话过期时间（小时）
+
+# ==================== JWT 认证 ====================
+jwt:
+  secret: ${JWT_SECRET:rag-campus-qa-default-secret-key-change-in-production}
+  expiration: 86400000   # Token 过期时间（毫秒），默认 24 小时

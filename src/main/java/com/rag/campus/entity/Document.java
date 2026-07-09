@@ -60,6 +60,12 @@ public class Document {
     /** 分块数量 */
     private Integer chunkCount;
 
+    /** 上传者用户ID */
+    private Long uploaderId;
+
+    /** 审核状态：PENDING / APPROVED / REJECTED */
+    private String reviewStatus;
+
     private LocalDateTime createTime;
     private LocalDateTime updateTime;
 }

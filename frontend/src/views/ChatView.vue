@@ -2,7 +2,7 @@
 import { ref, nextTick, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
-import { ask, getHistory, type AskResponse } from '../api/chat'
+import { ask, getHistory, getSessions, type AskResponse } from '../api/chat'
 import { getDocumentContent, type DocumentContent } from '../api/document'
 import PdfViewer from '../components/PdfViewer.vue'
 import { marked } from 'marked'
@@ -18,16 +18,7 @@ interface Conversation {
   title: string
 }
 
-const STORAGE_KEY = 'rag_conversations'
-
-function loadConversations(): Conversation[] {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]') } catch { return [] }
-}
-function saveConversations(list: Conversation[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(list))
-}
-
-const conversations = ref<Conversation[]>(loadConversations())
+const conversations = ref<Conversation[]>([])
 const activeId = ref<string>('')
 
 // ========== 消息管理 ==========
@@ -82,11 +73,7 @@ function newConversation() {
   if (activeId.value) {
     messageCache.set(activeId.value, [...messages.value])
   }
-  const id = generateUUID()
-  const conv: Conversation = { id, title: '新对话' }
-  conversations.value.unshift(conv)
-  saveConversations(conversations.value)
-  activeId.value = id
+  activeId.value = ''
   messages.value = []
   sidebarOpen.value = false
 }
@@ -94,7 +81,6 @@ function newConversation() {
 function deleteConversation(id: string) {
   conversations.value = conversations.value.filter(c => c.id !== id)
   messageCache.delete(id)
-  saveConversations(conversations.value)
   if (activeId.value === id) {
     activeId.value = ''
     messages.value = []
@@ -106,24 +92,22 @@ async function sendMessage() {
   const text = inputText.value.trim()
   if (!text || loading.value) return
 
-  if (!activeId.value) {
-    newConversation()
-  }
-
+  const isNew = !activeId.value
   inputText.value = ''
   messages.value.push({ role: 'user', content: text })
 
-  if (messages.value.filter(m => m.role === 'user').length === 1) {
-    const conv = conversations.value.find(c => c.id === activeId.value)
-    if (conv) {
-      conv.title = text.length > 15 ? text.slice(0, 15) + '...' : text
-      saveConversations(conversations.value)
-    }
-  }
-
   loading.value = true
   try {
-    const res = await ask(activeId.value, text)
+    // 新对话首次提问不传 sessionId，由后端生成
+    const res = await ask(isNew ? '' : activeId.value, text)
+
+    // 新对话：用后端返回的 sessionId 创建会话
+    if (isNew && res.sessionId) {
+      activeId.value = res.sessionId
+      const title = text.length > 15 ? text.slice(0, 15) + '...' : text
+      conversations.value.unshift({ id: res.sessionId, title })
+    }
+
     messages.value.push({
       role: 'assistant',
       content: res.answer,
@@ -131,6 +115,10 @@ async function sendMessage() {
     })
   } catch (e: any) {
     MessagePlugin.error(e?.response?.data?.errorMsg || '请求失败，请稍后重试')
+    // 新对话发送失败，清空刚加的消息
+    if (isNew) {
+      messages.value = []
+    }
   } finally {
     loading.value = false
     scrollToBottom()
@@ -256,20 +244,25 @@ function downloadDrawerDocument() {
 
 
 // ========== 工具 ==========
-function generateUUID(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const r = Math.random() * 16 | 0
-    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16)
-  })
-}
-
 // ========== Markdown 渲染（基于 marked，支持表格/代码块等） ==========
 function renderMarkdown(text: string): string {
   if (!text) return ''
   return marked.parse(text, { breaks: true, gfm: true }) as string
 }
 
-onMounted(() => {
+onMounted(async () => {
+  try {
+    const sessions = await getSessions()
+    if (sessions.length > 0) {
+      conversations.value = sessions.map(s => ({
+        id: s.sessionId,
+        title: s.title || '历史对话'
+      }))
+    }
+  } catch {
+    // 后端不可用，保持空列表
+  }
+
   if (conversations.value.length > 0) {
     activeId.value = conversations.value[0].id
     switchConversation(activeId.value)

@@ -6,12 +6,16 @@ import com.rag.campus.client.DeepSeekClient;
 import com.rag.campus.client.EmbeddingClient;
 import com.rag.campus.dto.ChatRequest;
 import com.rag.campus.dto.ChatResponse;
-import com.rag.campus.entity.Conversation;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.rag.campus.entity.ConversationMessage;
+import com.rag.campus.entity.ConversationSession;
 import com.rag.campus.entity.Document;
 import com.rag.campus.entity.DocumentChunk;
-import com.rag.campus.mapper.ConversationMapper;
+import com.rag.campus.mapper.ConversationMessageMapper;
+import com.rag.campus.mapper.ConversationSessionMapper;
 import com.rag.campus.mapper.DocumentMapper;
 import com.rag.campus.service.RagService;
+import com.rag.campus.service.UserService;
 import com.rag.campus.support.RagPromptTemplate;
 import com.rag.campus.support.VectorStore;
 import lombok.RequiredArgsConstructor;
@@ -41,9 +45,11 @@ public class RagServiceImpl implements RagService {
     private final DeepSeekClient deepSeekClient;
     private final EmbeddingClient embeddingClient;
     private final VectorStore vectorStore;
-    private final ConversationMapper conversationMapper;
+    private final ConversationSessionMapper sessionMapper;
+    private final ConversationMessageMapper messageMapper;
     private final DocumentMapper documentMapper;
     private final StringRedisTemplate redisTemplate;
+    private final UserService userService;
 
     @Value("${rag.retrieval.top-k:3}")
     private int topK;
@@ -70,9 +76,9 @@ public class RagServiceImpl implements RagService {
                     .build();
         }
 
-        // 生成或复用 sessionId
+        // 生成或复用 sessionId（8位字母数字，首次提问由后端生成）
         String sessionId = StrUtil.isBlank(request.getSessionId())
-                ? UUID.randomUUID().toString().substring(0, 8)
+                ? generateSessionId()
                 : request.getSessionId();
 
         log.info("RAG问答开始: sessionId={}, question={}", sessionId, question);
@@ -161,13 +167,46 @@ public class RagServiceImpl implements RagService {
             saveConversationHistory(sessionId, slimHistory, question, answer);
 
             // === Step 9: 持久化到 MySQL ===
-            Conversation conversation = new Conversation();
-            conversation.setSessionId(sessionId);
-            conversation.setQuestion(question);
-            conversation.setAnswer(answer);
-            conversation.setSources(JSONUtil.toJsonStr(sources));
-            conversation.setCreateTime(LocalDateTime.now());
-            conversationMapper.insert(conversation);
+            com.rag.campus.entity.User currentUser = userService.getCurrentUser();
+            Long userId = currentUser != null ? currentUser.getId() : null;
+
+            // 首次对话时创建 session
+            if (slimHistory.isEmpty()) {
+                ConversationSession session = new ConversationSession();
+                session.setSessionId(sessionId);
+                session.setUserId(userId);
+                session.setTitle(question.length() > 50 ? question.substring(0, 50) + "..." : question);
+                session.setCreateTime(LocalDateTime.now());
+                session.setLastActiveTime(LocalDateTime.now());
+                sessionMapper.insert(session);
+                // 新建会话 → 清掉用户的 sessions 缓存
+                if (userId != null) {
+                    redisTemplate.delete("rag:sessions:user:" + userId);
+                }
+            } else {
+                // 更新最后活跃时间（先查再改，避免 deprecation warning）
+                ConversationSession existSession = sessionMapper.selectOne(
+                        new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<ConversationSession>()
+                                .eq(ConversationSession::getSessionId, sessionId));
+                if (existSession != null) {
+                    existSession.setLastActiveTime(LocalDateTime.now());
+                    sessionMapper.updateById(existSession);
+                    // 活跃时间变了 → 清掉 sessions 缓存（排序可能变化）
+                    Long suid = existSession.getUserId();
+                    if (suid != null) {
+                        redisTemplate.delete("rag:sessions:user:" + suid);
+                    }
+                }
+            }
+
+            // 保存消息
+            ConversationMessage message = new ConversationMessage();
+            message.setSessionId(sessionId);
+            message.setQuestion(question);
+            message.setAnswer(answer);
+            message.setSources(JSONUtil.toJsonStr(sources));
+            message.setCreateTime(LocalDateTime.now());
+            messageMapper.insert(message);
 
             log.info("RAG问答完成: sessionId={}, searchQuery={}, hits={}", sessionId, searchQuery, hits.size());
 
@@ -187,44 +226,65 @@ public class RagServiceImpl implements RagService {
         }
     }
 
-    // ==================== 对话历史管理（Redis） ====================
+    // ==================== 对话历史管理（Redis 缓存 + MySQL 兜底） ====================
 
-    /**
-     * 从Redis加载最近N轮对话历史（瘦身格式：仅原始Q&A，不含system prompt和chunk）
-     * <p>
-     * 兼容处理：如果检测到旧格式（首条消息 role=system），说明是旧版本残留，
-     * 直接返回空列表开始新对话，旧 key 会在 TTL 后自然过期。
-     */
+    /** 从 MySQL 加载 N 轮并回填 Redis，返回对 LLM 友好的瘦身格式 */
     private List<Map<String, String>> loadConversationHistory(String sessionId) {
         String key = CONVERSATION_HISTORY_PREFIX + sessionId;
+
+        // 1. 尝试 Redis 缓存
         String json = redisTemplate.opsForValue().get(key);
-        if (StrUtil.isBlank(json)) {
+        if (StrUtil.isNotBlank(json)) {
+            try {
+                List<Map<String, String>> history = JSONUtil.toList(json, Map.class)
+                        .stream()
+                        .map(m -> (Map<String, String>) m)
+                        .collect(java.util.stream.Collectors.toList());
+                // 兼容旧格式
+                if (!history.isEmpty() && "system".equals(history.get(0).get("role"))) {
+                    log.info("检测到旧格式对话历史(sessionId={})，清除并重建", sessionId);
+                    redisTemplate.delete(key);
+                } else {
+                    return trimHistory(history);
+                }
+            } catch (Exception e) {
+                log.warn("Redis 解析失败，回退到 MySQL", e);
+            }
+        }
+
+        // 2. Redis miss → 查 MySQL 回填
+        List<ConversationMessage> messages = messageMapper.selectList(
+                new LambdaQueryWrapper<ConversationMessage>()
+                        .eq(ConversationMessage::getSessionId, sessionId)
+                        .orderByAsc(ConversationMessage::getCreateTime)
+        );
+
+        if (messages.isEmpty()) {
             return new ArrayList<>();
         }
 
-        try {
-            List<Map<String, String>> history = JSONUtil.toList(json, Map.class)
-                    .stream()
-                    .map(m -> (Map<String, String>) m)
-                    .collect(java.util.stream.Collectors.toList());
-
-            // 兼容旧格式：旧版本首条是 system prompt，检测到则丢弃，开始新对话
-            if (!history.isEmpty() && "system".equals(history.get(0).get("role"))) {
-                log.info("检测到旧格式对话历史(sessionId={})，将开始新对话", sessionId);
-                redisTemplate.delete(key);
-                return new ArrayList<>();
-            }
-
-            // 只保留最近 maxHistory 轮（一轮 = user + assistant 两条）
-            int maxMessages = maxHistory * 2;
-            if (history.size() > maxMessages) {
-                return history.subList(history.size() - maxMessages, history.size());
-            }
-            return history;
-        } catch (Exception e) {
-            log.warn("解析对话历史失败，将开始新对话", e);
-            return new ArrayList<>();
+        // 3. 转成瘦身格式 [{"role":"user","content":"..."}, ...]
+        List<Map<String, String>> history = new ArrayList<>();
+        for (ConversationMessage msg : messages) {
+            history.add(Map.of("role", "user", "content",
+                    StrUtil.blankToDefault(msg.getQuestion(), "")));
+            history.add(Map.of("role", "assistant", "content",
+                    StrUtil.blankToDefault(msg.getAnswer(), "")));
         }
+
+        // 4. 回填 Redis（短期 TTL，作为热缓存）
+        redisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(history), ttlHours, TimeUnit.HOURS);
+
+        return trimHistory(history);
+    }
+
+    /** 只保留最近 N 轮 */
+    private List<Map<String, String>> trimHistory(List<Map<String, String>> history) {
+        int maxMessages = maxHistory * 2;
+        if (history.size() > maxMessages) {
+            return history.subList(history.size() - maxMessages, history.size());
+        }
+        return history;
     }
 
     /**
@@ -479,5 +539,15 @@ public class RagServiceImpl implements RagService {
     private Long getDocId(VectorStore.Hit hit) {
         DocumentChunk chunk = vectorStore.getChunk(hit.getChunkId());
         return chunk != null ? chunk.getDocumentId() : null;
+    }
+
+    /** 生成 8 位字母数字对话 ID */
+    private static final String ID_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
+    private String generateSessionId() {
+        StringBuilder sb = new StringBuilder(8);
+        for (int i = 0; i < 8; i++) {
+            sb.append(ID_CHARS.charAt((int) (Math.random() * ID_CHARS.length())));
+        }
+        return sb.toString();
     }
 }

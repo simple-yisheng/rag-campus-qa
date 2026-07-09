@@ -8,20 +8,17 @@ import lombok.Data;
 import java.time.LocalDateTime;
 
 /**
- * 对话记录实体
+ * 对话消息实体 — 一轮 Q&A（question + answer）
  */
 @Data
-@TableName("tb_conversation")
-public class Conversation {
+@TableName("tb_conversation_message")
+public class ConversationMessage {
 
     @TableId(type = IdType.AUTO)
     private Long id;
 
-    /** 会话ID（UUID），用于关联多轮对话 */
+    /** 所属会话的短ID（关联 tb_conversation_session.session_id） */
     private String sessionId;
-
-    /** 用户ID（关联 tb_user.id） */
-    private Long userId;
 
     /** 用户问题 */
     private String question;
@@ -29,10 +26,7 @@ public class Conversation {
     /** 系统回答 */
     private String answer;
 
-    /**
-     * 引用来源，JSON格式
-     * 例如: [{"title":"本科生奖学金评定办法","chunkIndex":3,"score":0.95}]
-     */
+    /** 引用来源（JSON） */
     private String sources;
 
     private LocalDateTime createTime;

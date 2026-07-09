@@ -22,8 +22,9 @@
 |:---|:---|:---|
 | **后端框架** | Spring Boot 3.2 | REST API + MQ 消费者 |
 | **ORM** | MyBatis-Plus 3.5 | CRUD + 自定义查询 |
-| **数据库** | MySQL 8.0 | 文档 / 分块 / 对话记录持久化 |
-| **缓存** | Redis 7 | 对话历史（24h TTL，瘦身 Q&A） |
+| **安全认证** | Spring Security + JWT | 无状态认证，BCrypt 密码加密 |
+| **数据库** | MySQL 8.0 | 文档 / 分块 / 会话 / 消息持久化 |
+| **缓存** | Redis 7 | 对话上下文 + 历史/会话列表热缓存 |
 | **消息队列** | RabbitMQ 3.12 | 文档分块 + 向量化异步处理 |
 | **对象存储** | MinIO | 原始文件 + Word→PDF 预览存储 |
 | **LLM** | DeepSeek (deepseek-chat) | 问答生成 + 查询改写 |
@@ -151,9 +152,9 @@ rag-campus-qa/
 │   └── src/
 │       ├── main.ts / App.vue
 │       ├── router/index.ts
-│       ├── api/chat.ts, document.ts
+│       ├── api/index.ts, auth.ts, chat.ts, document.ts
 │       ├── components/PdfViewer.vue       # PDF.js 渲染 + 高亮组件
-│       └── views/ChatView.vue, DocumentView.vue
+│       └── views/{ChatView,DocumentView,LoginView,RegisterView,LayoutView}
 │
 ├── src/main/resources/
 │   ├── application.yaml                  # 主配置（可提交）
@@ -161,11 +162,12 @@ rag-campus-qa/
 │   └── db/init.sql, migration.sql
 │
 └── src/main/java/com/rag/campus/
-    ├── common/Result.java
-    ├── config/{AppConfig, RabbitMQConfig, MinioConfig, WebMvcConfig}
-    ├── entity/{Document, DocumentChunk, Conversation}
-    ├── mapper/{DocumentMapper, DocumentChunkMapper, ConversationMapper}
-    ├── dto/{ChatRequest, ChatResponse, DocumentUploadResult}
+    ├── common/{Result, GlobalExceptionHandler}
+    ├── config/{AppConfig, RabbitMQConfig, MinioConfig, WebMvcConfig, SecurityConfig}
+    ├── security/{JwtUtil, JwtAuthFilter}
+    ├── entity/{User, Document, DocumentChunk, ConversationSession, ConversationMessage}
+    ├── mapper/{UserMapper, DocumentMapper, DocumentChunkMapper, ConversationSessionMapper, ConversationMessageMapper}
+    ├── dto/{ChatRequest, ChatResponse, DocumentUploadResult, LoginRequest, RegisterRequest, LoginResponse}
     ├── client/{DeepSeekClient, EmbeddingClient}
     ├── support/
     │   ├── DocumentConverter.java          # 转换器接口（策略模式）
@@ -175,14 +177,22 @@ rag-campus-qa/
     │   ├── MinioStorageService.java        # MinIO 对象存储
     │   ├── OfficePreviewService.java       # Word→PDF 预览（LibreOffice）
     │   └── impl/{PdfBoxConverter, PlainTextConverter, DocxConverter}
-    ├── service/{DocumentService, RagService}
-    │   └── impl/{DocumentServiceImpl, RagServiceImpl, DocumentProcessConsumer}
-    └── controller/{DocumentController, ChatController}
+    ├── service/{DocumentService, RagService, UserService}
+    │   └── impl/{DocumentServiceImpl, RagServiceImpl, UserServiceImpl, DocumentProcessConsumer}
+    └── controller/{AuthController, DocumentController, ChatController}
 ```
 
 ---
 
 ## API 接口
+
+### 认证
+
+| 方法 | 路径 | 说明 |
+|:---|:---|:---|
+| POST | `/api/auth/register` | 注册 `{ "username","password","confirmPassword" }` |
+| POST | `/api/auth/login` | 登录 `{ "username","password" }` → `{ "token","username","role" }` |
+| GET | `/api/auth/me` | 获取当前用户信息（需 Bearer Token） |
 
 ### 文档管理
 
@@ -200,8 +210,9 @@ rag-campus-qa/
 
 | 方法 | 路径 | 说明 |
 |:---|:---|:---|
-| POST | `/api/chat/ask` | RAG 问答 `{ "sessionId?": "xxx", "question": "..." }` |
-| GET | `/api/chat/history/{sessionId}` | 查询对话历史 |
+| POST | `/api/chat/ask` | RAG 问答 `{ "sessionId?": "xxx", "question": "..." }`（首次不传 sessionId，后端自动生成） |
+| GET | `/api/chat/sessions` | 当前用户的会话列表 |
+| GET | `/api/chat/history/{sessionId}` | 查询指定会话的对话历史 |
 
 ---
 
@@ -209,11 +220,16 @@ rag-campus-qa/
 
 | 表 | 说明 |
 |:---|:---|
-| `tb_document` | 文档元信息（标题、分类、MD5、MinIO路径、状态） |
+| `tb_user` | 用户（用户名、BCrypt 密码、USER/ADMIN 角色） |
+| `tb_document` | 文档元信息（标题、分类、MD5、MinIO路径、状态、上传者） |
 | `tb_document_chunk` | 文档分块（文本、向量、PDF页码） |
-| `tb_conversation` | 对话记录（session_id、问答、引用来源 JSON） |
+| `tb_conversation_session` | 会话（8位短ID、用户、标题、活跃时间） |
+| `tb_conversation_message` | 对话消息（session_id、问答、引用来源 JSON） |
 
-Redis: `rag:conversation:{sessionId}` → 瘦身 Q&A 数组（仅原始问答，不含 chunk），24h TTL
+Redis 缓存：
+- `rag:conversation:{sid}` — 对话上下文（瘦身 Q&A），24h TTL
+- `rag:history:{sid}` — 历史消息缓存，5min TTL，新消息主动失效
+- `rag:sessions:user:{uid}` — 会话列表缓存，5min TTL
 
 ---
 
@@ -226,7 +242,9 @@ Redis: `rag:conversation:{sessionId}` → 瘦身 Q&A 数组（仅原始问答，
 3. **4 级自适应分块**：Markdown → Q&A → 中文结构 → 滑动窗口，不同文档自动匹配最优策略
 4. **多轮对话**：Redis 瘦身存储 + 查询改写（LLM 补全追问上下文）+ MySQL 持久化
 5. **异步处理**：RabbitMQ 解耦上传与处理，分块 + 向量化异步执行
-6. **表格处理**：DocxConverter 遍历 bodyElements 保留表格结构，PdfBoxConverter 坐标分析检测表格，Chunker 跨块补表头
+6. **用户认证**：Spring Security + JWT 无状态认证，BCrypt 密码加密，角色权限分离（USER/ADMIN）
+7. **缓存设计**：Redis 热缓存 + MySQL 兜底，定时失效 + 主动失效结合，保证数据一致性
+8. **表格处理**：DocxConverter 遍历 bodyElements 保留表格结构，PdfBoxConverter 坐标分析检测表格，Chunker 跨块补表头
 
 ---
 
