@@ -22,16 +22,18 @@
 |:---|:---|:---|
 | **后端框架** | Spring Boot 3.2 | REST API + MQ 消费者 |
 | **ORM** | MyBatis-Plus 3.5 | CRUD + 自定义查询 |
-| **安全认证** | Spring Security + JWT | 无状态认证，BCrypt 密码加密 |
+| **安全认证** | Spring Security + JWT | 无状态认证，BCrypt 密码加密，角色权限分离 |
 | **数据库** | MySQL 8.0 | 文档 / 分块 / 会话 / 消息持久化 |
 | **缓存** | Redis 7 | 对话上下文 + 历史/会话列表热缓存 |
 | **消息队列** | RabbitMQ 3.12 | 文档分块 + 向量化异步处理 |
 | **对象存储** | MinIO | 原始文件 + Word→PDF 预览存储 |
-| **LLM** | DeepSeek (deepseek-chat) | 问答生成 + 查询改写 |
+| **向量数据库** | Milvus 2.4（可选） | 向量存储与语义检索，IVF_FLAT + COSINE |
+| **LLM** | DeepSeek (deepseek-chat) | 问答生成（SSE 流式）+ 查询改写 |
 | **Embedding** | DashScope (text-embedding-v3) | 1024 维文本向量化 |
-| **PDF 处理** | PDFBox 2.x + PDF.js v4 | PDF 文本提取 / 前端渲染 |
+| **多模态** | 通义千问 VL (qwen-vl-plus) | PDF 扫描件 OCR + 嵌入图片描述 |
+| **PDF 处理** | PDFBox 2.x + PDF.js v4 | PDF 文本提取 / 表格检测 / 图片提取 / 前端渲染 |
 | **Word 处理** | Apache POI 5.x + LibreOffice | DOCX/DOC 提取 / PDF 预览转换 |
-| **前端** | Vue 3 + TDesign + marked | SPA，Vite 构建，嵌入 Spring Boot |
+| **前端** | Vue 3 + TDesign + marked | SPA，Vite 构建，嵌入 Spring Boot，SSE 流式渲染 |
 
 ---
 
@@ -102,20 +104,22 @@ npm run dev
 ## 核心架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Vue 3 前端（TDesign Chat）                                   │
-├─────────────────────────────────────────────────────────────┤
-│  POST /api/documents/upload   │  POST /api/chat/ask          │
-├───────────────────────────────┼──────────────────────────────┤
-│  文档上传链路                  │  RAG 问答链路                  │
-│  MD5去重 → Converter(策略)    │  查询改写(多轮上下文)           │
-│  → MySQL(PENDING) + MinIO     │  → Embedding(向量化)           │
-│  → Word LibreOffice转PDF      │  → VectorStore.search(宽窗口)  │
-│  → RabbitMQ → 异步处理        │  → 关键词加权 → 文档标题匹配    │
-│  → Chunker(4级自适应+表格感知) │  → 文档多样性截断 → 低分拦截    │
-│  → Embedding → MySQL+向量索引 │  → Prompt组装 → DeepSeek生成   │
-│                               │  → Redis(瘦身Q&A) + MySQL持久化│
-└───────────────────────────────┴──────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Vue 3 前端（TDesign Chat，SSE 流式渲染）                          │
+├──────────────────────────────────────────────────────────────────┤
+│  POST /api/documents/upload  │  POST /api/chat/ask/stream (SSE)  │
+├──────────────────────────────┼───────────────────────────────────┤
+│  文档上传链路                 │  RAG 问答链路                       │
+│  MD5去重 → Converter(策略)   │  查询改写(多轮上下文)                │
+│  → MySQL + MinIO             │  → Embedding(向量化)                │
+│  → 审核(USER→PENDING→ADMIN) │  → Milvus/HashMap.search(宽窗口)    │
+│  → Word LibreOffice转PDF     │  → 领域词+同义词关键词加权           │
+│  → RabbitMQ → 异步处理       │  → 意图分类标题调整(±0.22)          │
+│  → Chunker(4级自适应)        │  → 绝对+相对双阈值过滤               │
+│  → Embedding → MySQL+Milvus  │  → 文档多样性截断(≤3/doc)           │
+│                              │  → Prompt组装 → DeepSeek SSE 流式   │
+│                              │  → Redis(瘦身Q&A) + MySQL持久化     │
+└──────────────────────────────┴───────────────────────────────────┘
 ```
 
 ### 分块策略（4 级自适应）
@@ -163,23 +167,25 @@ rag-campus-qa/
 │
 └── src/main/java/com/rag/campus/
     ├── common/{Result, GlobalExceptionHandler}
-    ├── config/{AppConfig, RabbitMQConfig, MinioConfig, WebMvcConfig, SecurityConfig}
+    ├── config/{AppConfig, RabbitMQConfig, MinioConfig, MilvusConfig, WebMvcConfig, SecurityConfig}
     ├── security/{JwtUtil, JwtAuthFilter}
     ├── entity/{User, Document, DocumentChunk, ConversationSession, ConversationMessage}
     ├── mapper/{UserMapper, DocumentMapper, DocumentChunkMapper, ConversationSessionMapper, ConversationMessageMapper}
     ├── dto/{ChatRequest, ChatResponse, DocumentUploadResult, LoginRequest, RegisterRequest, LoginResponse}
-    ├── client/{DeepSeekClient, EmbeddingClient}
+    ├── client/{DeepSeekClient, EmbeddingClient, QwenVisionClient}
     ├── support/
     │   ├── DocumentConverter.java          # 转换器接口（策略模式）
     │   ├── DocumentChunker.java            # 4级自适应分块器
-    │   ├── VectorStore.java                # 内存向量索引
+    │   ├── VectorStore.java                # 向量存储接口
+    │   ├── InMemoryVectorStore.java        # 内存向量实现（默认）
+    │   ├── MilvusVectorStore.java          # Milvus 向量实现（生产）
     │   ├── RagPromptTemplate.java          # Prompt 模板
     │   ├── MinioStorageService.java        # MinIO 对象存储
     │   ├── OfficePreviewService.java       # Word→PDF 预览（LibreOffice）
-    │   └── impl/{PdfBoxConverter, PlainTextConverter, DocxConverter}
+    │   └── impl/{PdfBoxConverter, PlainTextConverter, DocxConverter, MarkItDownConverter}
     ├── service/{DocumentService, RagService, UserService}
     │   └── impl/{DocumentServiceImpl, RagServiceImpl, UserServiceImpl, DocumentProcessConsumer}
-    └── controller/{AuthController, DocumentController, ChatController}
+    └── controller/{AuthController, DocumentController, ChatController, AdminController}
 ```
 
 ---
@@ -210,9 +216,17 @@ rag-campus-qa/
 
 | 方法 | 路径 | 说明 |
 |:---|:---|:---|
-| POST | `/api/chat/ask` | RAG 问答 `{ "sessionId?": "xxx", "question": "..." }`（首次不传 sessionId，后端自动生成） |
+| POST | `/api/chat/ask` | RAG 问答（同步） `{ "sessionId?": "xxx", "question": "..." }` |
+| POST | `/api/chat/ask/stream` | RAG 问答（**SSE 流式**）— 打字机效果，`text/event-stream` |
 | GET | `/api/chat/sessions` | 当前用户的会话列表 |
 | GET | `/api/chat/history/{sessionId}` | 查询指定会话的对话历史 |
+
+### 审核（管理员）
+
+| 方法 | 路径 | 说明 |
+|:---|:---|:---|
+| PUT | `/api/documents/{id}/review` | 审核文档 `{ "approved": true/false }` — 通过→进入处理，驳回→不可检索 |
+| GET | `/api/admin/vector-stats` | 向量存储统计（管理员） |
 
 ---
 
@@ -235,16 +249,16 @@ Redis 缓存：
 
 ## 面试要点
 
-该项目使用传统后端技术（Redis 缓存、RabbitMQ 异步、MyBatis-Plus CRUD 为同一技术栈），适合在面试中展示以下亮点：
-
-1. **RAG 全链路**：问题 → 查询改写 → Embedding → 余弦相似度检索 → 关键词加权 → 文档归属匹配 → 多样性截断 → 低分拦截 → Prompt 组装 → LLM 生成 → 瘦身持久化
-2. **DocumentConverter 策略模式**：新增格式只需添加实现类，Spring 自动注入，符合开闭原则
-3. **4 级自适应分块**：Markdown → Q&A → 中文结构 → 滑动窗口，不同文档自动匹配最优策略
-4. **多轮对话**：Redis 瘦身存储 + 查询改写（LLM 补全追问上下文）+ MySQL 持久化
-5. **异步处理**：RabbitMQ 解耦上传与处理，分块 + 向量化异步执行
-6. **用户认证**：Spring Security + JWT 无状态认证，BCrypt 密码加密，角色权限分离（USER/ADMIN）
-7. **缓存设计**：Redis 热缓存 + MySQL 兜底，定时失效 + 主动失效结合，保证数据一致性
-8. **表格处理**：DocxConverter 遍历 bodyElements 保留表格结构，PdfBoxConverter 坐标分析检测表格，Chunker 跨块补表头
+1. **RAG 全链路**：查询改写 → Embedding → Milvus/COSINE 检索 → 领域词+同义词加权 → 意图分类标题调整 → 双阈值过滤 → 多样性截断 → Prompt 组装 → **SSE 流式生成** → 来源去重限制
+2. **检索策略**：76 领域词库 + 同义词映射 + `QueryTerm` 带权重模型 + 考试/综测/竞赛意图分类 + 标题交叉降权（-0.18）+ 名录加成（+0.22）+ 绝对 0.55 + 相对 topScore×0.8 双阈值
+3. **向量存储**：`VectorStore` 接口 → `InMemoryVectorStore`（开发/Demo）+ `MilvusVectorStore`（生产），策略模式，一行配置切换，启动自动迁移
+4. **DocumentConverter 策略模式**：自定义转换器接口，已有 6 种实现（PDF/Word/TXT/MD + 扫描件 OCR + 图片描述），新增格式只需加实现类
+5. **多模态处理**：扫描件 PDF → 渲染页面为图片 → 通义千问 VL OCR 逐页识别；嵌入图片 → 提取 → VL 描述 → 注入 chunk
+6. **SSE 流式回答**：DeepSeek stream → RestTemplate ResponseExtractor → SseEmitter 独立线程 → fetch ReadableStream 前端打字机
+7. **4 级自适应分块**：Markdown 标题 → Q&A 格式 → 中文结构 → 滑动窗口，含 Markdown 表格感知跨块补表头
+8. **文档审核权限**：USER 上传→PENDING→ADMIN 通过/驳回→MQ 处理→入向量库，普通用户不可检索未审核文档
+9. **多轮对话**：Redis 瘦身存储（仅原始 Q&A，去 chunk）+ 查询改写（LLM 补全上下文）+ MySQL 持久化
+10. **缓存设计**：3 种 Redis Key + 读 miss 回填 + 写主动失效 + MySQL 兜底
 
 ---
 
