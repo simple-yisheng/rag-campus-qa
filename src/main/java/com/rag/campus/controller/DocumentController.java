@@ -65,6 +65,27 @@ public class DocumentController {
     }
 
     /**
+     * 审核文档（仅管理员）
+     * <p>
+     * PUT /api/documents/{id}/review
+     * Body: { "approved": true }  通过审核，自动进入分块+向量化处理
+     * Body: { "approved": false } 驳回，文档不可检索
+     */
+    @PutMapping("/{id}/review")
+    public Result review(@PathVariable Long id, @RequestBody Map<String, Boolean> body) {
+        Boolean approved = body.get("approved");
+        if (approved == null) {
+            return Result.fail("缺少 approved 参数");
+        }
+        try {
+            documentService.reviewDocument(id, approved);
+            return Result.ok(approved ? "审核通过，文档进入后台处理" : "已驳回");
+        } catch (IllegalArgumentException e) {
+            return Result.fail(e.getMessage());
+        }
+    }
+
+    /**
      * 下载/预览文档原始文件
      * <p>
      * GET /api/documents/{id}/file

@@ -66,6 +66,9 @@ public class Document {
     /** 审核状态：PENDING / APPROVED / REJECTED */
     private String reviewStatus;
 
+    /** 审核人用户ID */
+    private Long reviewerId;
+
     private LocalDateTime createTime;
     private LocalDateTime updateTime;
 }

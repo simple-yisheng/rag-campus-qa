@@ -1,12 +1,21 @@
 package com.rag.campus.support.impl;
 
+import com.rag.campus.client.QwenVisionClient;
 import com.rag.campus.support.DocumentConverter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDResources;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.apache.pdfbox.text.TextPosition;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -14,11 +23,17 @@ import java.util.stream.Collectors;
 /**
  * PDF 文本提取器（基于 Apache PDFBox）
  * <p>
- * 通过分析文本坐标检测表格结构，将表格区域输出为 Markdown 表格格式。
- * 文本提取委托给 PDFBox 原生 writeString（保留下标/基线处理），
- * 仅在 {@code processTextPosition} 中收集坐标用于表格检测。
+ * 支持三种 PDF 类型：
+ * <ol>
+ *   <li><b>普通 PDF</b> — PDFBox 提取文字 + 坐标分析检测表格 → Markdown</li>
+ *   <li><b>含图片的 PDF</b> — 提取嵌入图片 → 通义千问 VL 描述 → 注入文档文本</li>
+ *   <li><b>扫描件 PDF</b> — 检测文字为空 → 渲染页面为图片 → VL OCR 识别</li>
+ * </ol>
  * <p>
- * 注意：扫描版 PDF（图片型）无法提取，需 OCR。
+ * 面试要点：
+ * 1. 扫描件检测：PDFBox 提取不到文字 → 判定为扫描件 → OCR 兜底
+ * 2. 图片信息不丢失：多模态 LLM 将图片转为文字描述，RAG 可检索
+ * 3. 优雅降级：VL API 失败不影响核心文本提取
  */
 @Slf4j
 @Component
@@ -38,32 +53,225 @@ public class PdfBoxConverter implements DocumentConverter {
     /** 同一列的 X 坐标跨行对齐容差（磅） */
     private static final float COL_ALIGN_TOLERANCE = 8.0f;
 
+    /** 判定为扫描件的文字长度阈值（全文档） */
+    private static final int SCANNED_TEXT_THRESHOLD = 100;
+
+    /** 扫描件页面渲染 DPI（平衡清晰度与 API 调用成本） */
+    private static final int SCAN_RENDER_DPI = 150;
+
+    /** 提取图片的最小尺寸（小于此尺寸的忽略，如图标、装饰元素） */
+    private static final int MIN_IMAGE_WIDTH = 100;
+    private static final int MIN_IMAGE_HEIGHT = 100;
+
+    /** 每篇文档最多提取的图片数量（控制 API 成本） */
+    private static final int MAX_IMAGES_PER_DOC = 6;
+
+    /** 扫描件最多 OCR 的页数 */
+    private static final int MAX_OCR_PAGES = 20;
+
+    private final QwenVisionClient visionClient;
+
+    @Value("${rag.vision.enabled:true}")
+    private boolean visionEnabled;
+
+    @Value("${rag.vision.max-images:6}")
+    private int maxImagesPerDoc;
+
+    public PdfBoxConverter(QwenVisionClient visionClient) {
+        this.visionClient = visionClient;
+    }
+
     @Override
     public String convert(byte[] fileBytes, String filename) throws IOException {
         try (PDDocument pdfDoc = PDDocument.load(fileBytes)) {
+            int totalPages = pdfDoc.getNumberOfPages();
 
+            // === 第一步：普通文本提取 + 表格检测 ===
             TableAwareStripper stripper = new TableAwareStripper();
             stripper.setSortByPosition(true);
-
-            // 触发 PDFBox 原生文本提取（writeString 未被覆盖，保留下标处理）
-            // 同时 processTextPosition 收集坐标用于表格检测
             String normalText = stripper.getText(pdfDoc);
-
-            // 用坐标数据检测表格，将表格区域替换为 Markdown
             String result = stripper.injectMarkdownTables(normalText);
+            int extractedLen = result.replaceAll("\\s+", "").length();
+
+            // === 第二步：判断是否为扫描件 ===
+            if (extractedLen < SCANNED_TEXT_THRESHOLD && totalPages > 0) {
+                log.info("检测到扫描件 PDF: {}, 页数={}, 文本长度={}", filename, totalPages, extractedLen);
+                if (visionEnabled) {
+                    return ocrScannedPdf(pdfDoc, fileBytes, filename);
+                } else {
+                    throw new IOException("PDF 无可提取的文字内容，可能是扫描版 PDF。"
+                            + "如需 OCR 识别，请在 application.yaml 中启用 rag.vision.enabled=true");
+                }
+            }
+
+            // === 第三步：提取并描述嵌入图片（普通 PDF） ===
+            if (visionEnabled && extractedLen > 0) {
+                String imageDescriptions = extractAndDescribeImages(pdfDoc, fileBytes, filename);
+                if (!imageDescriptions.isEmpty()) {
+                    result = result + "\n\n## 文档附图说明\n" + imageDescriptions;
+                }
+            }
 
             if (result.isBlank()) {
-                throw new IOException("PDF文件无可提取的文字内容，可能是扫描版PDF");
+                throw new IOException("PDF 文件无可提取的文字内容");
             }
-            log.info("PDF文本提取成功: {}, 字符数={}, 检测表格数={}",
-                    filename, result.length(), stripper.getTableCount());
+
+            log.info("PDF 文本提取成功: {}, 页数={}, 字符数={}, 表格数={}",
+                    filename, totalPages, result.length(), stripper.getTableCount());
             return result;
+
         }
     }
 
     @Override
     public Set<String> supportedExtensions() {
         return EXTENSIONS;
+    }
+
+    // ==================== 扫描件 OCR ====================
+
+    /**
+     * 对扫描版 PDF 逐页 OCR 识别
+     * <p>
+     * 用 PDFBox PDFRenderer 将每页渲染为图片，
+     * 发送给通义千问 VL 进行 OCR 文字识别。
+     */
+    private String ocrScannedPdf(PDDocument pdfDoc, byte[] fileBytes, String filename) {
+        int totalPages = pdfDoc.getNumberOfPages();
+        int pagesToProcess = Math.min(totalPages, MAX_OCR_PAGES);
+        StringBuilder fullText = new StringBuilder();
+
+        log.info("扫描件 OCR 开始: {}, 总页数={}, 处理页数={}", filename, totalPages, pagesToProcess);
+
+        // 重新加载文档给 PDFRenderer（原 doc 被 stripper 消费过，需要重新打开）
+        try (PDDocument renderDoc = PDDocument.load(fileBytes)) {
+            PDFRenderer renderer = new PDFRenderer(renderDoc);
+
+            for (int page = 0; page < pagesToProcess; page++) {
+                try {
+                    // 渲染页面为图片
+                    BufferedImage image = renderer.renderImageWithDPI(page, SCAN_RENDER_DPI);
+                    byte[] pngBytes = bufferedImageToPngBytes(image);
+
+                    log.debug("OCR 第 {}/{} 页, 图片大小={}KB", page + 1, pagesToProcess, pngBytes.length / 1024);
+
+                    String pageText = visionClient.ocrPage(pngBytes);
+                    if (!pageText.isEmpty()) {
+                        fullText.append("第").append(page + 1).append("页\n");
+                        fullText.append(pageText).append("\n\n");
+                    } else {
+                        log.warn("扫描件第 {} 页 OCR 返回空", page + 1);
+                    }
+
+                    // 页间延迟，避免触发 QPS 限流
+                    if (page < pagesToProcess - 1) {
+                        Thread.sleep(300);
+                    }
+
+                } catch (Exception e) {
+                    log.warn("扫描件第 {} 页 OCR 失败: {}", page + 1, e.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            log.error("扫描件 OCR 渲染失败", e);
+        }
+
+        String result = fullText.toString().trim();
+        if (result.isEmpty()) {
+            log.error("扫描件 OCR 全部失败: {}", filename);
+            return "【扫描件 OCR 识别失败】该文档为图片型 PDF，自动文字识别未成功，建议手动录入文字内容。";
+        }
+
+        log.info("扫描件 OCR 完成: {}, 总字符数={}", filename, result.length());
+        return result;
+    }
+
+    // ==================== 嵌入图片处理 ====================
+
+    /**
+     * 提取 PDF 中嵌入的图片，用 VL 模型生成文字描述
+     */
+    private String extractAndDescribeImages(PDDocument pdfDoc, byte[] fileBytes, String filename) {
+        List<byte[]> images = new ArrayList<>();
+
+        try {
+            for (PDPage page : pdfDoc.getPages()) {
+                if (images.size() >= maxImagesPerDoc) break;
+
+                PDResources resources = page.getResources();
+                if (resources == null) continue;
+
+                for (org.apache.pdfbox.cos.COSName name : resources.getXObjectNames()) {
+                    if (images.size() >= maxImagesPerDoc) break;
+                    try {
+                        if (!resources.isImageXObject(name)) continue;
+                        PDImageXObject image = (PDImageXObject) resources.getXObject(name);
+
+                        // 过滤太小的图片（图标、装饰元素等）
+                        if (image.getWidth() < MIN_IMAGE_WIDTH || image.getHeight() < MIN_IMAGE_HEIGHT) {
+                            continue;
+                        }
+
+                        BufferedImage buffered = image.getImage();
+                        byte[] pngBytes = bufferedImageToPngBytes(buffered);
+                        if (pngBytes.length > 0) {
+                            images.add(pngBytes);
+                        }
+                    } catch (Exception e) {
+                        log.debug("提取图片失败: name={}, {}", name.getName(), e.getMessage());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("遍历 PDF 图片资源失败: {}", e.getMessage());
+        }
+
+        if (images.isEmpty()) {
+            return "";
+        }
+
+        log.info("PDF 提取到 {} 张嵌入图片: {}", images.size(), filename);
+
+        // 逐张描述
+        StringBuilder descriptions = new StringBuilder();
+        for (int i = 0; i < images.size(); i++) {
+            try {
+                String mimeType = "image/png";
+                String context = "第 " + (i + 1) + " 张附图";
+                String desc = visionClient.describeImage(images.get(i), mimeType, context);
+                if (!desc.isEmpty()) {
+                    descriptions.append("\n**附图 ").append(i + 1).append("**：").append(desc).append("\n");
+                } else {
+                    log.warn("图片 {} 描述返回空", i + 1);
+                }
+
+                // 图片间延迟
+                if (i < images.size() - 1) {
+                    Thread.sleep(200);
+                }
+            } catch (Exception e) {
+                log.warn("图片 {} 描述失败: {}", i + 1, e.getMessage());
+            }
+        }
+
+        log.info("PDF 图片描述完成: {}, 图片数={}, 描述字符数={}",
+                filename, images.size(), descriptions.length());
+        return descriptions.toString();
+    }
+
+    // ==================== 工具方法 ====================
+
+    /**
+     * BufferedImage → PNG 字节数组
+     */
+    private byte[] bufferedImageToPngBytes(BufferedImage image) {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+            ImageIO.write(image, "png", baos);
+            return baos.toByteArray();
+        } catch (IOException e) {
+            log.warn("图片转 PNG 失败: {}", e.getMessage());
+            return new byte[0];
+        }
     }
 
     // ==================== 内部类 ====================

@@ -7,13 +7,19 @@ import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /**
  * DeepSeek LLM 客户端
@@ -79,6 +85,98 @@ public class DeepSeekClient {
                         + "只输出改写后的问题，不要加任何解释。"));
         messages.add(Map.of("role", "user", "content", userPrompt));
         return doChatLight(messages);
+    }
+
+    /**
+     * 流式对话 — 逐 token 回调
+     * <p>
+     * 调用 DeepSeek Chat API（stream=true），通过 SSE 逐块接收生成内容。
+     * 每个 token 到达时调用 {@code onToken}，全部完成时调用 {@code onComplete}。
+     * <p>
+     * 面试要点：SSE 在 RAG 中的应用——检索+Prompt组装完成后，
+     * LLM 生成阶段用流式传输，用户不必等完整回答。
+     *
+     * @param messages   完整对话消息
+     * @param onToken    每收到一个 token 时的回调
+     * @param onComplete 全部 token 接收完毕时的回调（传入完整回答文本）
+     * @param onError    发生错误时的回调
+     */
+    public void chatStream(List<Map<String, String>> messages,
+                           Consumer<String> onToken,
+                           Consumer<String> onComplete,
+                           Consumer<String> onError) {
+        String url = baseUrl + "/chat/completions";
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", chatModel);
+        body.put("messages", messages);
+        body.put("temperature", 0.3);
+        body.put("max_tokens", 4096);
+        body.put("stream", true);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("Authorization", "Bearer " + apiKey);
+
+        try {
+            // 使用 execute + ResponseExtractor 实现流式读取
+            RestTemplate streamingTemplate = new RestTemplate();
+            SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+            factory.setBufferRequestBody(false);
+            streamingTemplate.setRequestFactory(factory);
+
+            StringBuilder fullAnswer = new StringBuilder();
+
+            streamingTemplate.execute(url, HttpMethod.POST,
+                    request -> {
+                        request.getHeaders().addAll(headers);
+                        try (OutputStream os = request.getBody()) {
+                            os.write(JSONUtil.toJsonStr(body).getBytes(StandardCharsets.UTF_8));
+                            os.flush();
+                        }
+                    },
+                    response -> {
+                        try (BufferedReader reader = new BufferedReader(
+                                new InputStreamReader(response.getBody(), StandardCharsets.UTF_8))) {
+                            String line;
+                            while ((line = reader.readLine()) != null) {
+                                if (line.isEmpty()) continue;
+                                if (!line.startsWith("data: ")) continue;
+
+                                String data = line.substring(6).trim();
+                                if ("[DONE]".equals(data)) break;
+
+                                try {
+                                    JSONObject json = JSONUtil.parseObj(data);
+                                    JSONArray choices = json.getJSONArray("choices");
+                                    if (choices != null && !choices.isEmpty()) {
+                                        JSONObject delta = choices.getJSONObject(0)
+                                                .getJSONObject("delta");
+                                        String content = delta.getStr("content");
+                                        if (StrUtil.isNotBlank(content)) {
+                                            fullAnswer.append(content);
+                                            onToken.accept(content);
+                                        }
+                                    }
+                                } catch (Exception e) {
+                                    log.debug("解析 SSE token 失败: {}", data);
+                                }
+                            }
+                        }
+                        return null;
+                    });
+
+            String answer = fullAnswer.toString();
+            if (answer.isEmpty()) {
+                onError.accept("模型未返回任何内容");
+            } else {
+                onComplete.accept(answer);
+            }
+
+        } catch (Exception e) {
+            log.error("DeepSeek 流式调用失败", e);
+            onError.accept("流式调用失败: " + e.getMessage());
+        }
     }
 
     /**

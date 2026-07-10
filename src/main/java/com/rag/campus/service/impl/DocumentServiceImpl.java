@@ -154,6 +154,9 @@ public class DocumentServiceImpl implements DocumentService {
         }
 
         // 4. 保存文档记录（先插入，获取自增ID）
+        com.rag.campus.entity.User uploader = userService.getCurrentUser();
+        boolean isAdmin = uploader != null && "ADMIN".equals(uploader.getRole());
+
         Document doc = new Document();
         doc.setTitle(StrUtil.isBlank(title) ? originalName : title);
         doc.setCategory(category);
@@ -164,7 +167,8 @@ public class DocumentServiceImpl implements DocumentService {
         doc.setStatus("PENDING");
         doc.setChunkCount(0);
         doc.setUploaderId(getCurrentUserId());
-        doc.setReviewStatus("APPROVED");
+        // 管理员上传自动通过，普通用户上传需审核
+        doc.setReviewStatus(isAdmin ? "APPROVED" : "PENDING");
         doc.setCreateTime(LocalDateTime.now());
         documentMapper.insert(doc);
 
@@ -193,15 +197,23 @@ public class DocumentServiceImpl implements DocumentService {
             }
         }
 
-        // 7. 发送MQ消息，异步处理
-        rabbitTemplate.convertAndSend(DOCUMENT_PROCESS_EXCHANGE, DOCUMENT_PROCESS_ROUTING_KEY, doc.getId());
+        // 7. 管理员上传自动处理；普通用户需等审核通过后再处理
+        if (isAdmin) {
+            rabbitTemplate.convertAndSend(DOCUMENT_PROCESS_EXCHANGE, DOCUMENT_PROCESS_ROUTING_KEY, doc.getId());
+            log.info("管理员上传文档，自动进入处理队列: id={}, title={}", doc.getId(), doc.getTitle());
+        } else {
+            log.info("普通用户上传文档，待审核: id={}, title={}", doc.getId(), doc.getTitle());
+        }
 
-        log.info("文档上传成功: id={}, title={}, md5={}, 字符数={}", doc.getId(), doc.getTitle(), md5, text.length());
+        String uploadMsg = isAdmin
+                ? "文档上传成功，正在后台处理中，请稍候..."
+                : "文档上传成功，请等待管理员审核通过后即可检索使用";
         return DocumentUploadResult.builder()
                 .documentId(doc.getId())
                 .title(doc.getTitle())
                 .status("PENDING")
-                .message("文档上传成功，正在后台处理中，请稍候...")
+                .reviewStatus(doc.getReviewStatus())
+                .message(uploadMsg)
                 .build();
     }
 
@@ -277,6 +289,39 @@ public class DocumentServiceImpl implements DocumentService {
         // DB 删除（chunks 通过 CASCADE 自动删除）
         documentMapper.deleteById(documentId);
         log.info("文档已删除: id={}, title={}", documentId, doc.getTitle());
+    }
+
+    @Override
+    @Transactional
+    public void reviewDocument(Long documentId, boolean approved) {
+        Document doc = documentMapper.selectById(documentId);
+        if (doc == null) {
+            throw new IllegalArgumentException("文档不存在");
+        }
+
+        // 仅管理员可审核
+        com.rag.campus.entity.User currentUser = userService.getCurrentUser();
+        if (currentUser == null || !"ADMIN".equals(currentUser.getRole())) {
+            throw new IllegalArgumentException("仅管理员可审核文档");
+        }
+
+        if (!"PENDING".equals(doc.getReviewStatus())) {
+            throw new IllegalArgumentException("该文档不需要审核（当前状态: " + doc.getReviewStatus() + "）");
+        }
+
+        if (approved) {
+            doc.setReviewStatus("APPROVED");
+            doc.setReviewerId(currentUser.getId());
+            documentMapper.updateById(doc);
+            // 审核通过 → 发送 MQ 进入异步处理
+            rabbitTemplate.convertAndSend(DOCUMENT_PROCESS_EXCHANGE, DOCUMENT_PROCESS_ROUTING_KEY, doc.getId());
+            log.info("文档审核通过，进入处理队列: id={}, title={}", documentId, doc.getTitle());
+        } else {
+            doc.setReviewStatus("REJECTED");
+            doc.setReviewerId(currentUser.getId());
+            documentMapper.updateById(doc);
+            log.info("文档审核驳回: id={}, title={}", documentId, doc.getTitle());
+        }
     }
 
     @Override

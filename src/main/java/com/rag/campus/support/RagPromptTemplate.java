@@ -31,7 +31,10 @@ public class RagPromptTemplate {
                 2. 如果参考资料中没有相关信息，请如实告知用户"该问题在知识库中暂无收录，建议咨询辅导员或查看学校官网"
                 3. 回答要简洁清晰、条理分明，使用序号或分段提高可读性
                 4. 在回答末尾标注引用的资料标题
-                5. 语气友好、耐心，服务于在校学生""";
+                5. 如果参考资料包含表格、名录、清单、项目列表，请优先使用 Markdown 表格输出，保留原有列含义
+                6. 列举多个条目时，每个条目必须独立成行，禁止把大量条目用短横线或顿号连续拼接成一整段
+                7. 表格、名录、清单类内容默认只展示最相关或最靠前的 8 项，不要完整展开长表
+                8. 语气友好、耐心，服务于在校学生""";
     }
 
     /**
@@ -60,8 +63,8 @@ public class RagPromptTemplate {
                     .append(i + 1)
                     .append("（来源：《")
                     .append(title)
-                    .append("》，匹配度: ")
-                    .append(String.format("%.2f", hit.getScore()))
+                    .append("》，相关度: ")
+                    .append(String.format("%.2f", Math.min(1.0, hit.getScore())))
                     .append("）---\n")
                     .append(chunk.getChunkText())
                     .append("\n\n");
@@ -69,7 +72,14 @@ public class RagPromptTemplate {
 
         return contextBuilder.toString() +
                "用户问题：" + question + "\n\n" +
-               "请根据以上参考资料回答。";
+               """
+               请根据以上参考资料回答。
+               输出格式要求：
+               1. 如果用户询问"有哪些/名单/名录/清单/项目"，优先整理为 Markdown 表格。
+               2. 如果资料中出现"竞赛名称/竞赛级别"等列，请输出为表格，列名建议为：序号、竞赛名称、竞赛级别。
+               3. 不要把多个竞赛、项目或条目压缩在同一行；一项一行。
+               4. 表格、名录、清单类内容默认只输出最相关或最靠前的 8 项。
+               5. 如果条目超过 8 项，在表格后说明"以上仅列出部分条目，完整名单请点击参考资料查看原文"。""";
     }
 
     /**
@@ -106,6 +116,17 @@ public class RagPromptTemplate {
             List<VectorStore.Hit> hits,
             java.util.function.Function<Long, DocumentChunk> chunkResolver,
             java.util.function.Function<Long, Document> documentResolver) {
+        return buildSources(hits, chunkResolver, documentResolver, Integer.MAX_VALUE);
+    }
+
+    /**
+     * 从检索结果构建 SourceInfo 列表，并限制展示数量。
+     */
+    public static List<ChatResponse.SourceInfo> buildSources(
+            List<VectorStore.Hit> hits,
+            java.util.function.Function<Long, DocumentChunk> chunkResolver,
+            java.util.function.Function<Long, Document> documentResolver,
+            int limit) {
 
         // 按 documentId 去重，每篇文档只保留最高分的 chunk
         Map<Long, ChatResponse.SourceInfo> bestPerDoc = new LinkedHashMap<>();
@@ -130,12 +151,14 @@ public class RagPromptTemplate {
                         .chunkIndex(chunk.getChunkIndex())
                         .pageStart(chunk.getPageStart())
                         .pageEnd(chunk.getPageEnd())
-                        .score((double) hit.getScore())
+                        .score(Math.min(1.0, (double) hit.getScore()))
                         .snippet(snippet)
                         .build());
             }
         }
 
-        return new ArrayList<>(bestPerDoc.values());
+        return bestPerDoc.values().stream()
+                .limit(Math.max(0, limit))
+                .collect(Collectors.toList());
     }
 }

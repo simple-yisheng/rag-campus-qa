@@ -8,6 +8,8 @@ export interface DocumentInfo {
   fileType: string
   status: string
   chunkCount: number
+  reviewStatus: string
+  uploaderId: number
   createTime: string
 }
 
@@ -58,4 +60,9 @@ export async function uploadDocument(
   if (department) form.append('department', department)
   const res = await api.post('/documents/upload', form)
   return res.data.data
+}
+
+/** 审核文档（仅管理员） */
+export async function reviewDocument(id: number, approved: boolean): Promise<void> {
+  await api.put(`/documents/${id}/review`, { approved })
 }

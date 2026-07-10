@@ -2,9 +2,16 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
-import { listDocuments, uploadDocument, deleteDocument, type DocumentInfo } from '../api/document'
+import { listDocuments, uploadDocument, deleteDocument, reviewDocument, type DocumentInfo } from '../api/document'
 
 const router = useRouter()
+
+// 当前用户角色
+const isAdmin = ref(false)
+try {
+  const user = JSON.parse(localStorage.getItem('user') || '{}')
+  isAdmin.value = user.role === 'ADMIN'
+} catch { /* ignore */ }
 
 // ========== 文档列表 ==========
 const documents = ref<DocumentInfo[]>([])
@@ -90,6 +97,20 @@ async function handleDelete(id: number) {
   }
 }
 
+const reviewing = ref(false)
+async function handleReview(doc: DocumentInfo, approved: boolean) {
+  reviewing.value = true
+  try {
+    await reviewDocument(doc.id, approved)
+    MessagePlugin.success(approved ? '审核通过，文档已进入后台处理' : '已驳回')
+    fetchDocuments()
+  } catch {
+    MessagePlugin.error('审核操作失败')
+  } finally {
+    reviewing.value = false
+  }
+}
+
 function viewFile(doc: DocumentInfo) {
   window.open(`/api/documents/${doc.id}/file`)
 }
@@ -105,14 +126,24 @@ function statusTag(status: string) {
   return map[status] || { label: status, theme: 'default' }
 }
 
+function reviewTag(status: string) {
+  const map: Record<string, { label: string; theme: string }> = {
+    APPROVED: { label: '已通过', theme: 'success' },
+    PENDING: { label: '待审核', theme: 'warning' },
+    REJECTED: { label: '已驳回', theme: 'danger' }
+  }
+  return map[status] || { label: status, theme: 'default' }
+}
+
 const columns = [
-  { colKey: 'title', title: '标题', width: 280 },
-  { colKey: 'category', title: '分类', width: 100 },
-  { colKey: 'fileType', title: '格式', width: 80 },
-  { colKey: 'status', title: '状态', width: 100, cell: 'status' },
-  { colKey: 'chunkCount', title: '分块数', width: 80 },
-  { colKey: 'createTime', title: '上传时间', width: 170 },
-  { colKey: 'action', title: '操作', width: 80, cell: 'action' }
+  { colKey: 'title', title: '标题', width: 220 },
+  { colKey: 'category', title: '分类', width: 90 },
+  { colKey: 'fileType', title: '格式', width: 65 },
+  { colKey: 'status', title: '处理', width: 80, cell: 'status' },
+  { colKey: 'reviewStatus', title: '审核', width: 80, cell: 'reviewStatus' },
+  { colKey: 'chunkCount', title: '分块', width: 60 },
+  { colKey: 'createTime', title: '上传时间', width: 155 },
+  { colKey: 'action', title: '操作', width: 160, cell: 'action' }
 ]
 
 function formatTime(time: string) {
@@ -167,12 +198,39 @@ onMounted(fetchDocuments)
               {{ statusTag(row.status).label }}
             </t-tag>
           </template>
+          <template #reviewStatus="{ row }">
+            <t-tag :theme="reviewTag(row.reviewStatus).theme" variant="light" size="small">
+              {{ reviewTag(row.reviewStatus).label }}
+            </t-tag>
+          </template>
           <template #createTime="{ row }">
             {{ formatTime(row.createTime) }}
           </template>
           <template #action="{ row }">
-            <t-link theme="primary" hover="color" @click="viewFile(row)" v-if="row.status === 'DONE'">
-              查看原文
+            <!-- 管理员审核按钮（PENDING 文档） -->
+            <template v-if="isAdmin && row.reviewStatus === 'PENDING'">
+              <t-button theme="success" size="small" variant="outline"
+                :loading="reviewing" @click="handleReview(row, true)">
+                通过
+              </t-button>
+              <t-popconfirm content="确认驳回该文档？驳回后文档不可检索" @confirm="handleReview(row, false)">
+                <t-button theme="danger" size="small" variant="outline" style="margin-left:4px">
+                  驳回
+                </t-button>
+              </t-popconfirm>
+            </template>
+            <!-- 普通用户：待审核提示 -->
+            <t-tag v-else-if="row.reviewStatus === 'PENDING'" theme="warning" variant="light" size="small">
+              等待审核
+            </t-tag>
+            <!-- 已驳回提示 -->
+            <t-tag v-else-if="row.reviewStatus === 'REJECTED'" theme="danger" variant="light" size="small">
+              已驳回
+            </t-tag>
+            <!-- 查看原文（已完成处理） -->
+            <t-link v-if="row.status === 'DONE'" theme="primary" hover="color"
+              @click="viewFile(row)" style="margin-left:4px">
+              原文
             </t-link>
             <t-popconfirm content="确认删除该文档？" @confirm="handleDelete(row.id)">
               <t-link theme="danger" hover="color" style="margin-left:8px">删除</t-link>

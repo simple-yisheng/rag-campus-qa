@@ -88,4 +88,15 @@ public interface DocumentService {
      * @return chunk 列表，文档不存在或尚无 chunk 时返回空列表
      */
     List<DocumentChunk> getDocumentChunks(Long documentId);
+
+    /**
+     * 审核文档（仅管理员）
+     * <p>
+     * 管理员审核通过 → 发送 MQ 进入异步处理（分块 + 向量化）。
+     * 管理员驳回 → 标记为 REJECTED，不进入检索库。
+     *
+     * @param documentId 文档ID
+     * @param approved   true=通过，false=驳回
+     */
+    void reviewDocument(Long documentId, boolean approved);
 }

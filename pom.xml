@@ -125,6 +125,20 @@
             <version>8.5.7</version>
         </dependency>
 
+        <!-- Milvus 向量数据库 Java SDK -->
+        <dependency>
+            <groupId>io.milvus</groupId>
+            <artifactId>milvus-sdk-java</artifactId>
+            <version>2.4.3</version>
+            <exclusions>
+                <!-- 排除自带的 logging，使用 Spring Boot 的 logback -->
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-slf4j-impl</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
         <!-- 测试 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

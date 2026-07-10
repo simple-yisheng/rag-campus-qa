@@ -15,7 +15,12 @@ import com.rag.campus.service.RagService;
 import com.rag.campus.service.UserService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.MediaType;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -42,7 +47,7 @@ public class ChatController {
     private static final DateTimeFormatter DTF = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     /**
-     * RAG问答
+     * RAG问答（同步）
      */
     @PostMapping("/ask")
     public Result ask(@RequestBody ChatRequest request) {
@@ -50,11 +55,56 @@ public class ChatController {
             return Result.fail("问题不能为空");
         }
         ChatResponse response = ragService.ask(request);
-        // 新消息产生，清掉该 session 的历史缓存
         if (response.getSessionId() != null) {
             redisTemplate.delete(HISTORY_CACHE_PREFIX + response.getSessionId());
         }
         return Result.ok(response);
+    }
+
+    /**
+     * RAG问答 — SSE 流式输出
+     * <p>
+     * POST /api/chat/ask/stream
+     * <p>
+     * 事件格式：
+     * <pre>
+     *   data: {"token":"文"}          → 逐字推送
+     *   event: sources               → 引用来源
+     *   data: {"sessionId":"..","sources":[...]}
+     *   event: done                   → 完成
+     *   event: error                  → 错误
+     *   data: {"error":"..."}
+     * </pre>
+     */
+    @PostMapping(value = "/ask/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter askStream(@RequestBody ChatRequest request) {
+        if (request.getQuestion() == null || request.getQuestion().isBlank()) {
+            SseEmitter emitter = new SseEmitter();
+            try {
+                emitter.send(SseEmitter.event().name("error")
+                        .data("{\"error\":\"问题不能为空\"}"));
+                emitter.complete();
+            } catch (Exception ignored) {}
+            return emitter;
+        }
+
+        SseEmitter emitter = new SseEmitter(120_000L); // 2 分钟超时
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+
+        // 关键：在独立线程中执行 RAG 检索 + LLM 流式调用，
+        // 让 controller 立即返回 emitter，Spring 框架才能开始推送 SSE 事件
+        new Thread(() -> {
+            try {
+                SecurityContext securityContext = SecurityContextHolder.createEmptyContext();
+                securityContext.setAuthentication(authentication);
+                SecurityContextHolder.setContext(securityContext);
+                ragService.askStream(request, emitter);
+            } finally {
+                SecurityContextHolder.clearContext();
+            }
+        }).start();
+
+        return emitter;
     }
 
     /**

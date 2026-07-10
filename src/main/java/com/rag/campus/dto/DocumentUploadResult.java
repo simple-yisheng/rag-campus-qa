@@ -25,4 +25,7 @@ public class DocumentUploadResult {
 
     /** 提示信息 */
     private String message;
+
+    /** 审核状态: PENDING / APPROVED / REJECTED */
+    private String reviewStatus;
 }

@@ -22,7 +22,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -65,6 +67,67 @@ public class RagServiceImpl implements RagService {
 
     /** Redis Key前缀 */
     private static final String CONVERSATION_HISTORY_PREFIX = "rag:conversation:";
+    private static final String HISTORY_CACHE_PREFIX = "rag:history:";
+    private static final int SOURCE_LIMIT = 5;
+    private static final double RELATIVE_SCORE_RATIO = 0.8;
+    private static final double KEYWORD_BOOST_MAX = 0.35;
+    private static final float ZERO_KEYWORD_PENALTY = -0.12f;
+
+    private static final Set<String> DOMAIN_TERMS = Set.of(
+            "考试", "考试管理", "考试管理办法", "考场", "证件", "学生证", "一卡通", "监考", "违纪", "作弊",
+            "缓考", "补考", "重修", "成绩", "英语摸底", "分级考试", "英语分级", "听力", "耳机",
+            "综测", "综合测评", "综合素质测评", "素质测评", "奖学金", "评优", "评奖评优", "德育", "智育", "体育",
+            "竞赛", "学科竞赛", "竞赛项目", "项目名录", "竞赛名录", "认定竞赛", "赛事", "比赛",
+            "转专业", "保研", "推免", "学籍", "休学", "复学", "退学", "毕业", "学位"
+    );
+
+    private static final Set<String> ASSESSMENT_TITLE_TERMS = Set.of(
+            "综测", "综合测评", "综合素质测评", "素质测评", "奖学金", "评优", "评奖评优"
+    );
+
+    private static final Set<String> EXAM_INTENT_TERMS = Set.of(
+            "考试", "考试管理", "考场", "证件", "监考", "违纪", "作弊", "缓考", "补考", "英语摸底", "分级考试"
+    );
+
+    private static final Set<String> COMPETITION_INTENT_TERMS = Set.of(
+            "竞赛", "学科竞赛", "竞赛项目", "项目名录", "竞赛名录", "认定竞赛", "赛事", "比赛"
+    );
+
+    private static final Set<String> CATALOG_TITLE_TERMS = Set.of(
+            "名录", "目录", "清单", "项目名录", "竞赛项目", "认定"
+    );
+
+    private static final Set<String> LIST_QUERY_TERMS = Set.of(
+            "哪些", "有哪些", "有什么", "名录", "目录", "清单", "列表"
+    );
+
+    private static final Set<String> STOPWORDS = Set.of(
+            "请问", "一下", "什么", "如何", "怎么", "吗", "呢", "的", "了", "是", "在", "和", "与", "或",
+            "有", "我", "你", "他", "这", "那", "哪", "吧", "啊", "要", "需要", "注意", "可以", "是否",
+            "想问", "想知道", "帮我查", "问一下"
+    );
+
+    private static final Map<String, Set<String>> SYNONYM_TERMS = Map.ofEntries(
+            Map.entry("综测", Set.of("综测", "综合测评", "综合素质测评", "素质测评")),
+            Map.entry("综合测评", Set.of("综合测评", "综测", "综合素质测评", "素质测评")),
+            Map.entry("综合素质测评", Set.of("综合素质测评", "综合测评", "素质测评", "综测")),
+            Map.entry("素质测评", Set.of("素质测评", "综合测评", "综合素质测评", "综测")),
+            Map.entry("评奖评优", Set.of("评奖评优", "评优", "奖学金", "荣誉称号")),
+            Map.entry("评优", Set.of("评优", "评奖评优", "奖学金", "荣誉称号")),
+            Map.entry("奖学金", Set.of("奖学金", "评奖评优", "评优")),
+            Map.entry("竞赛", Set.of("竞赛", "学科竞赛", "竞赛项目", "项目名录", "竞赛名录", "赛事", "比赛")),
+            Map.entry("学科竞赛", Set.of("学科竞赛", "竞赛", "竞赛项目", "项目名录", "竞赛名录")),
+            Map.entry("竞赛项目", Set.of("竞赛项目", "学科竞赛", "竞赛", "项目名录", "竞赛名录")),
+            Map.entry("项目名录", Set.of("项目名录", "竞赛项目", "竞赛名录", "学科竞赛", "竞赛")),
+            Map.entry("竞赛名录", Set.of("竞赛名录", "项目名录", "竞赛项目", "学科竞赛", "竞赛")),
+            Map.entry("赛事", Set.of("赛事", "比赛", "竞赛", "学科竞赛")),
+            Map.entry("比赛", Set.of("比赛", "赛事", "竞赛", "学科竞赛")),
+            Map.entry("考试", Set.of("考试", "考核", "测验")),
+            Map.entry("英语摸底", Set.of("英语摸底", "英语分级", "分级考试")),
+            Map.entry("分级考试", Set.of("分级考试", "英语分级", "英语摸底")),
+            Map.entry("违纪", Set.of("违纪", "作弊", "违规")),
+            Map.entry("作弊", Set.of("作弊", "违纪", "违规"))
+    );
 
     @Override
     public ChatResponse ask(ChatRequest request) {
@@ -109,29 +172,15 @@ public class RagServiceImpl implements RagService {
                         .build();
             }
 
-            // === Step 3: 语义检索（先用大窗口召回，再关键词加权，最后截断） ===
-            int candidateSize = Math.min(topK * 3, vectorStore.size());
-            List<VectorStore.Hit> candidates = vectorStore.search(questionVector, candidateSize);
-            if (candidates.isEmpty()) {
+            // === Step 3: 语义检索 + 重排过滤 ===
+            List<VectorStore.Hit> hits = retrieveRelevantHits(searchQuery, questionVector);
+            if (hits.isEmpty()) {
                 return ChatResponse.builder()
                         .sessionId(sessionId)
                         .answer("知识库中暂无相关内容。请先上传相关文档后再提问，或尝试换一种问法。")
                         .sources(Collections.emptyList())
                         .build();
             }
-
-            // 关键词加权重排序（向量分 + 关键词命中；使用改写后的查询做关键词提取）
-            // 召回 2× topK，为后续文档多样性过滤留空间
-            List<VectorStore.Hit> reranked = rerankByKeywordBoost(searchQuery, candidates, topK * 2);
-
-            // 文档标题匹配加分：查询含"材料学院"→材料学院文档的 chunk 加分
-            List<VectorStore.Hit> boosted = boostByDocumentTitle(searchQuery, reranked);
-
-            // 文档多样性截断：每个文档最多贡献 3 个 chunk，防止单个文档霸榜
-            List<VectorStore.Hit> hits = applyDocumentDiversity(boosted, topK);
-
-            // 低分拦截：过滤相似度不达标的chunk，减少无关参考资料
-            hits = filterByMinScore(hits);
 
             // 缓存文档查询（buildUserPrompt + buildSources 各自遍历 hits，共用缓存避免重复查DB）
             Map<Long, Document> docCache = new HashMap<>();
@@ -160,7 +209,7 @@ public class RagServiceImpl implements RagService {
 
             // === Step 7: 构建引用来源 ===
             List<ChatResponse.SourceInfo> sources = RagPromptTemplate.buildSources(
-                    hits, vectorStore::getChunk, cachedDocResolver
+                    hits, vectorStore::getChunk, cachedDocResolver, SOURCE_LIMIT
             );
 
             // === Step 8: 保存瘦身对话历史到 Redis（仅原始Q&A） ===
@@ -224,6 +273,167 @@ public class RagServiceImpl implements RagService {
                     .sources(Collections.emptyList())
                     .build();
         }
+    }
+
+    @Override
+    public void askStream(ChatRequest request, SseEmitter emitter) {
+        String question = request.getQuestion();
+        if (StrUtil.isBlank(question)) {
+            sendSseError(emitter, "请输入您的问题。");
+            return;
+        }
+
+        String sessionId = StrUtil.isBlank(request.getSessionId())
+                ? generateSessionId()
+                : request.getSessionId();
+
+        log.info("RAG流式问答开始: sessionId={}, question={}", sessionId, question);
+
+        try {
+            // === Step 1-5: 检索增强（与同步 ask 完全相同） ===
+            List<Map<String, String>> slimHistory = loadConversationHistory(sessionId);
+
+            String searchQuery = question;
+            if (!slimHistory.isEmpty()) {
+                String rewritePrompt = RagPromptTemplate.buildRewritePrompt(slimHistory, question);
+                String rewritten = deepSeekClient.rewriteQuery(rewritePrompt);
+                if (StrUtil.isNotBlank(rewritten) && !rewritten.equals(question)) {
+                    log.info("查询改写: {} -> {}", question, rewritten);
+                    searchQuery = rewritten;
+                }
+            }
+
+            float[] questionVector = embeddingClient.embed(searchQuery);
+            if (questionVector.length == 0) {
+                sendSseError(emitter, "向量化服务暂不可用");
+                return;
+            }
+
+            List<VectorStore.Hit> hits = retrieveRelevantHits(searchQuery, questionVector);
+            if (hits.isEmpty()) {
+                sendSseError(emitter, "知识库中暂无相关内容");
+                return;
+            }
+
+            Map<Long, Document> docCache = new HashMap<>();
+            java.util.function.Function<Long, Document> cachedDocResolver = id ->
+                    docCache.computeIfAbsent(id, this::getDocumentById);
+
+            String systemPrompt = RagPromptTemplate.buildSystemPrompt();
+            String userPrompt = RagPromptTemplate.buildUserPrompt(
+                    question, hits, vectorStore::getChunk, cachedDocResolver);
+
+            List<Map<String, String>> messages = new ArrayList<>();
+            messages.add(Map.of("role", "system", "content", systemPrompt));
+            messages.addAll(slimHistory);
+            messages.add(Map.of("role", "user", "content", userPrompt));
+
+            // === Step 6: 流式 LLM 生成 ===
+            List<ChatResponse.SourceInfo> sources = RagPromptTemplate.buildSources(
+                    hits, vectorStore::getChunk, cachedDocResolver, SOURCE_LIMIT);
+
+            deepSeekClient.chatStream(messages,
+                    // onToken：逐字推送给前端
+                    token -> {
+                        try {
+                            Map<String, Object> event = new HashMap<>();
+                            event.put("token", token);
+                            emitter.send(SseEmitter.event()
+                                    .data(event, MediaType.APPLICATION_JSON));
+                        } catch (Exception e) {
+                            log.debug("SSE 发送 token 失败", e);
+                        }
+                    },
+                    // onComplete：推送来源 + 完成信号，保存记录
+                    answer -> {
+                        try {
+                            // 发送来源
+                            Map<String, Object> doneEvent = new HashMap<>();
+                            doneEvent.put("sessionId", sessionId);
+                            doneEvent.put("sources", sources);
+                            emitter.send(SseEmitter.event()
+                                    .name("sources")
+                                    .data(doneEvent, MediaType.APPLICATION_JSON));
+
+                            // 发送完成信号
+                            emitter.send(SseEmitter.event()
+                                    .name("done")
+                                    .data(""));
+
+                            // 持久化
+                            saveConversationHistory(sessionId, slimHistory, question, answer);
+                            persistConversation(sessionId, slimHistory, question, answer, sources);
+
+                            emitter.complete();
+                        } catch (Exception e) {
+                            log.error("SSE 完成发送失败", e);
+                            emitter.completeWithError(e);
+                        }
+                    },
+                    // onError
+                    errorMsg -> sendSseError(emitter, errorMsg)
+            );
+
+        } catch (Exception e) {
+            log.error("RAG流式问答异常", e);
+            sendSseError(emitter, "系统异常: " + e.getMessage());
+        }
+    }
+
+    private void sendSseError(SseEmitter emitter, String msg) {
+        try {
+            Map<String, Object> event = new HashMap<>();
+            event.put("error", msg);
+            emitter.send(SseEmitter.event()
+                    .name("error")
+                    .data(event, MediaType.APPLICATION_JSON));
+            emitter.complete();
+        } catch (Exception ex) {
+            emitter.completeWithError(ex);
+        }
+    }
+
+    /**
+     * 持久化对话记录（提取自 ask() 供 askStream 复用）
+     */
+    private void persistConversation(String sessionId, List<Map<String, String>> slimHistory,
+                                     String question, String answer, List<ChatResponse.SourceInfo> sources) {
+        com.rag.campus.entity.User currentUser = userService.getCurrentUser();
+        Long userId = currentUser != null ? currentUser.getId() : null;
+
+        if (slimHistory.isEmpty()) {
+            ConversationSession session = new ConversationSession();
+            session.setSessionId(sessionId);
+            session.setUserId(userId);
+            session.setTitle(question.length() > 50 ? question.substring(0, 50) + "..." : question);
+            session.setCreateTime(LocalDateTime.now());
+            session.setLastActiveTime(LocalDateTime.now());
+            sessionMapper.insert(session);
+            if (userId != null) {
+                redisTemplate.delete("rag:sessions:user:" + userId);
+            }
+        } else {
+            ConversationSession existSession = sessionMapper.selectOne(
+                    new LambdaQueryWrapper<ConversationSession>()
+                            .eq(ConversationSession::getSessionId, sessionId));
+            if (existSession != null) {
+                existSession.setLastActiveTime(LocalDateTime.now());
+                sessionMapper.updateById(existSession);
+                Long suid = existSession.getUserId();
+                if (suid != null) {
+                    redisTemplate.delete("rag:sessions:user:" + suid);
+                }
+            }
+        }
+
+        ConversationMessage message = new ConversationMessage();
+        message.setSessionId(sessionId);
+        message.setQuestion(question);
+        message.setAnswer(answer);
+        message.setSources(JSONUtil.toJsonStr(sources));
+        message.setCreateTime(LocalDateTime.now());
+        messageMapper.insert(message);
+        redisTemplate.delete(HISTORY_CACHE_PREFIX + sessionId);
     }
 
     // ==================== 对话历史管理（Redis 缓存 + MySQL 兜底） ====================
@@ -314,31 +524,40 @@ public class RagServiceImpl implements RagService {
     }
 
     /**
-     * 关键词加权重排序
-     * <p>
-     * 纯向量检索有时会把"高分但语义有偏差"的chunk排在前面。
-     * 此方法对候选chunk做关键词匹配加分，使向量相似度+关键词双重命中
-     * 的chunk排到更前面。
-     * <p>
-     * 示例：查询"考试违纪的认定及处理"
-     *   - 关键词: 考试, 违纪, 认定, 处理
-     *   - chunk 若含"违纪"→+0.15, 含"认定"→再+0.05，以此类推
-     *
-     * @param query      用户原始查询
-     * @param candidates 向量检索的较大候选集
-     * @param topK       最终返回数量
+     * 统一检索链路：召回 → 关键词重排 → 标题/意图重排 → 阈值过滤 → 文档多样性截断。
      */
-    private List<VectorStore.Hit> rerankByKeywordBoost(String query,
-                                                        List<VectorStore.Hit> candidates,
-                                                        int topK) {
-        // 1. 提取查询中的关键词（长度≥2的中文词）
-        List<String> keywords = extractKeywords(query);
+    private List<VectorStore.Hit> retrieveRelevantHits(String searchQuery, float[] questionVector) {
+        int candidateSize = Math.min(topK * 3, vectorStore.size());
+        if (candidateSize <= 0) {
+            return Collections.emptyList();
+        }
 
-        if (keywords.isEmpty() || candidates.isEmpty()) {
+        List<VectorStore.Hit> candidates = vectorStore.search(questionVector, candidateSize);
+        if (candidates.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<QueryTerm> terms = extractQueryTerms(searchQuery);
+        List<VectorStore.Hit> reranked = rerankByKeywordBoost(candidates, terms, candidates.size());
+        List<VectorStore.Hit> titleBoosted = boostByDocumentTitle(searchQuery, terms, reranked);
+        List<VectorStore.Hit> filtered = filterByMinScore(titleBoosted);
+        filtered = filterByRelativeScore(filtered);
+        return applyDocumentDiversity(filtered, topK);
+    }
+
+    /**
+     * 关键词加权重排序 + 条件式零命中惩罚。
+     */
+    private List<VectorStore.Hit> rerankByKeywordBoost(List<VectorStore.Hit> candidates,
+                                                       List<QueryTerm> terms,
+                                                       int topK) {
+        if (terms.isEmpty() || candidates.isEmpty()) {
             return candidates.subList(0, Math.min(topK, candidates.size()));
         }
 
-        // 2. 对每个候选chunk计算关键词加分
+        double totalWeight = terms.stream().mapToDouble(QueryTerm::weight).sum();
+        boolean enableZeroPenalty = terms.stream().anyMatch(QueryTerm::strong);
+
         List<VectorStore.Hit> boosted = new ArrayList<>();
         for (VectorStore.Hit hit : candidates) {
             DocumentChunk chunk = vectorStore.getChunk(hit.getChunkId());
@@ -350,58 +569,105 @@ public class RagServiceImpl implements RagService {
                 continue;
             }
 
-            // 计算关键词命中率（去重命中）
-            int hitCount = 0;
-            for (String kw : keywords) {
-                if (chunkText.contains(kw)) {
-                    hitCount++;
+            double matchedWeight = 0;
+            for (QueryTerm term : terms) {
+                if (chunkText.contains(term.term())) {
+                    matchedWeight += term.weight();
                 }
             }
-            double keywordRatio = (double) hitCount / keywords.size();
 
-            // 向量分 + 关键词加分（最多 +0.2）
-            float boostedScore = (float) (hit.getScore() + 0.2 * keywordRatio);
-            boosted.add(new VectorStore.Hit(hit.getChunkId(), boostedScore));
+            float boost = 0f;
+            if (matchedWeight <= 0 && enableZeroPenalty) {
+                boost = ZERO_KEYWORD_PENALTY;
+            } else if (totalWeight > 0) {
+                boost = (float) (KEYWORD_BOOST_MAX * (matchedWeight / totalWeight));
+            }
+
+            boosted.add(new VectorStore.Hit(hit.getChunkId(), hit.getScore() + boost));
         }
 
-        // 3. 按加分后的分数降序排列，取 topK
         boosted.sort((a, b) -> Float.compare(b.getScore(), a.getScore()));
         return boosted.subList(0, Math.min(topK, boosted.size()));
     }
 
     /**
-     * 从查询中提取关键词
-     * 策略：按常见分隔符切分后，保留长度≥2的中文字符段
+     * 提取带权重的查询词。
+     * <p>
+     * 不做全量字符 bigram，避免生成"试管""理办"这类跨语义边界噪声。
      */
-    private List<String> extractKeywords(String query) {
+    private List<QueryTerm> extractQueryTerms(String query) {
         if (StrUtil.isBlank(query)) return Collections.emptyList();
 
-        // 按标点/空格切分
-        String[] parts = query.split("[，。？?！!、；;：:\\s]+");
-        List<String> keywords = new ArrayList<>();
+        String cleaned = query.replaceAll("^(请问|我想问|我想知道|帮我查|问一下|请问一下)", "").trim();
+        Map<String, QueryTerm> terms = new LinkedHashMap<>();
+
+        // 领域词优先，权重最高。
+        DOMAIN_TERMS.stream()
+                .sorted((a, b) -> Integer.compare(b.length(), a.length()))
+                .filter(cleaned::contains)
+                .forEach(term -> putTermWithSynonyms(terms, term, 2.0, true));
+
+        String normalized = cleaned.replaceAll("(以及|有关|关于|需要|注意|什么|如何|怎么|哪些|有什么|怎么办|的|及|和|与|或|要|吗|呢|了|是|在)", " ");
+        String[] parts = normalized.split("[，。？?！!、；;：:\\s]+");
         for (String part : parts) {
             String trimmed = part.trim();
-            // 过滤单字和无意义词
-            if (trimmed.length() >= 2
-                    && !trimmed.equals("请问")
-                    && !trimmed.equals("一下")
-                    && !trimmed.equals("什么")
-                    && !trimmed.equals("如何")
-                    && !trimmed.equals("怎么")
-                    && !trimmed.equals("吗")
-                    && !trimmed.equals("呢")
-                    && !trimmed.equals("的")) {
-                keywords.add(trimmed);
-            }
+            if (!isUsefulTerm(trimmed)) continue;
+
+            putTermWithSynonyms(terms, trimmed, 1.5, trimmed.length() >= 4);
+            addBoundaryTerms(terms, trimmed);
         }
-        return keywords;
+
+        return new ArrayList<>(terms.values());
     }
 
+    private void addBoundaryTerms(Map<String, QueryTerm> terms, String phrase) {
+        if (phrase.length() < 4) return;
+
+        putTerm(terms, phrase.substring(0, 2), 0.8, false);
+        putTerm(terms, phrase.substring(phrase.length() - 2), 0.8, false);
+
+        if (phrase.length() >= 5) {
+            putTerm(terms, phrase.substring(0, 4), 1.0, false);
+            putTerm(terms, phrase.substring(phrase.length() - 4), 1.0, false);
+        }
+    }
+
+    private void putTerm(Map<String, QueryTerm> terms, String term, double weight, boolean strong) {
+        if (!isUsefulTerm(term)) return;
+
+        QueryTerm existing = terms.get(term);
+        if (existing == null || weight > existing.weight() || (strong && !existing.strong())) {
+            terms.put(term, new QueryTerm(term, weight, strong || (existing != null && existing.strong())));
+        }
+    }
+
+    private void putTermWithSynonyms(Map<String, QueryTerm> terms, String term, double weight, boolean strong) {
+        putTerm(terms, term, weight, strong);
+
+        Set<String> synonyms = SYNONYM_TERMS.get(term);
+        if (synonyms == null) return;
+
+        for (String synonym : synonyms) {
+            putTerm(terms, synonym, weight, true);
+        }
+    }
+
+    private boolean isUsefulTerm(String term) {
+        if (StrUtil.isBlank(term) || term.length() < 2 || STOPWORDS.contains(term)) {
+            return false;
+        }
+        return term.chars().anyMatch(ch -> Character.UnicodeScript.of(ch) == Character.UnicodeScript.HAN);
+    }
+
+    /** 兼容少量旧调用语义：只返回词面。 */
+    private List<String> extractKeywords(String query) {
+        return extractQueryTerms(query).stream().map(QueryTerm::term).toList();
+    }
+
+    private record QueryTerm(String term, double weight, boolean strong) {}
+
     /**
-     * 低分拦截：过滤相似度不达标的 chunk
-     * <p>
-     * 无关文档的 chunk 可能因词汇交集获得一定向量分（如 0.3~0.45），
-     * 但实际内容不相关。0.4 的阈值可有效过滤这类"虚高"结果。
+     * 低分拦截：过滤综合相关度不达标的 chunk。
      */
     private List<VectorStore.Hit> filterByMinScore(List<VectorStore.Hit> hits) {
         if (hits.isEmpty()) return hits;
@@ -412,11 +678,32 @@ public class RagServiceImpl implements RagService {
             }
         }
         if (filtered.isEmpty()) {
-            // 全部被过滤时退回原始结果（避免无结果）
-            log.warn("所有chunk均低于最低分阈值({}), 退回原始结果", minScore);
-            return hits;
+            log.warn("所有chunk均低于最低分阈值({}), 保留最高分chunk作为兜底", minScore);
+            return hits.subList(0, 1);
         }
         log.debug("低分过滤: {} → {} 个chunk (threshold={})", hits.size(), filtered.size(), minScore);
+        return filtered;
+    }
+
+    /**
+     * 相对阈值过滤：弱相关 chunk 即便超过绝对阈值，也不能距离最高分太远。
+     */
+    private List<VectorStore.Hit> filterByRelativeScore(List<VectorStore.Hit> hits) {
+        if (hits.isEmpty()) return hits;
+        float topScore = hits.get(0).getScore();
+        double threshold = Math.max(minScore, topScore * RELATIVE_SCORE_RATIO);
+
+        List<VectorStore.Hit> filtered = new ArrayList<>();
+        for (VectorStore.Hit hit : hits) {
+            if (hit.getScore() >= threshold) {
+                filtered.add(hit);
+            }
+        }
+
+        if (filtered.isEmpty()) {
+            return hits.subList(0, 1);
+        }
+        log.debug("相对分过滤: {} → {} 个chunk (threshold={})", hits.size(), filtered.size(), threshold);
         return filtered;
     }
 
@@ -452,9 +739,10 @@ public class RagServiceImpl implements RagService {
      * 加分策略：第一个实体匹配 +0.15，后续实体逐次递减（语义上用户最先提到的通常最重要）
      */
     private List<VectorStore.Hit> boostByDocumentTitle(String query,
+                                                       List<QueryTerm> terms,
                                                        List<VectorStore.Hit> candidates) {
         List<String> entities = extractEntityNames(query);
-        if (entities.isEmpty() || candidates.isEmpty()) return candidates;
+        if (candidates.isEmpty()) return candidates;
 
         // 预加载所有 documentId → title 映射（避免重复查 DB）
         Map<Long, String> titleCache = new HashMap<>();
@@ -475,20 +763,70 @@ public class RagServiceImpl implements RagService {
 
             if (docId != null) {
                 String title = titleCache.get(docId);
-                if (title != null) {
-                    // 按实体顺序加权：第一个匹配的实体加分最高
-                    for (int i = 0; i < entities.size(); i++) {
-                        if (title.contains(entities.get(i))) {
-                            bonus = Math.max(bonus, 0.15f - i * 0.05f);
-                        }
-                    }
-                }
+                bonus = calculateTitleBonus(query, terms, entities, title);
             }
             boosted.add(new VectorStore.Hit(hit.getChunkId(), hit.getScore() + bonus));
         }
 
         boosted.sort((a, b) -> Float.compare(b.getScore(), a.getScore()));
         return boosted;
+    }
+
+    private float calculateTitleBonus(String query,
+                                      List<QueryTerm> terms,
+                                      List<String> entities,
+                                      String title) {
+        if (StrUtil.isBlank(title)) return 0f;
+
+        double totalWeight = terms.stream().mapToDouble(QueryTerm::weight).sum();
+        double matchedWeight = 0;
+        for (QueryTerm term : terms) {
+            if (title.contains(term.term())) {
+                matchedWeight += term.weight();
+            }
+        }
+
+        float bonus = 0f;
+        if (totalWeight > 0 && matchedWeight > 0) {
+            bonus += (float) (0.25 * (matchedWeight / totalWeight));
+        }
+
+        for (int i = 0; i < entities.size(); i++) {
+            if (title.contains(entities.get(i))) {
+                bonus = Math.max(bonus, 0.15f - i * 0.05f);
+            }
+        }
+
+        boolean examIntent = containsAny(query, EXAM_INTENT_TERMS) || terms.stream()
+                .map(QueryTerm::term)
+                .anyMatch(EXAM_INTENT_TERMS::contains);
+        boolean assessmentIntent = containsAny(query, ASSESSMENT_TITLE_TERMS);
+        if (examIntent && !assessmentIntent && containsAny(title, ASSESSMENT_TITLE_TERMS)) {
+            bonus -= 0.18f;
+        }
+
+        boolean competitionIntent = containsAny(query, COMPETITION_INTENT_TERMS) || terms.stream()
+                .map(QueryTerm::term)
+                .anyMatch(COMPETITION_INTENT_TERMS::contains);
+        boolean listIntent = containsAny(query, LIST_QUERY_TERMS);
+        if (competitionIntent && listIntent && containsAny(title, CATALOG_TITLE_TERMS)) {
+            bonus += 0.22f;
+        }
+        if (competitionIntent && title.toUpperCase(Locale.ROOT).contains("FAQ")) {
+            bonus -= 0.08f;
+        }
+
+        return bonus;
+    }
+
+    private boolean containsAny(String text, Set<String> terms) {
+        if (StrUtil.isBlank(text)) return false;
+        for (String term : terms) {
+            if (text.contains(term)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

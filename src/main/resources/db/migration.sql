@@ -79,3 +79,16 @@ FROM tb_conversation;
 
 -- 3. 删除旧表（确认迁移无误后执行；首次迁移可先注释掉，验证后再手动删）
 -- DROP TABLE IF EXISTS tb_conversation;
+
+-- ============================================================
+-- v4: 文档审核人字段
+-- ============================================================
+
+ALTER TABLE tb_document ADD COLUMN reviewer_id BIGINT DEFAULT NULL COMMENT '审核人用户ID';
+
+-- 将已有 APPROVED 状态的文档的默认审核人设为上传者（仅作为兜底，实际审核应由管理员操作）
+-- UPDATE tb_document SET reviewer_id = uploader_id WHERE review_status = 'APPROVED' AND reviewer_id IS NULL;
+
+-- 修正默认值：新上传的文档默认审核状态应为 PENDING（已有数据的默认值仍为 APPROVED）
+-- 如果你希望已有文档保持可检索，不执行下面这条：
+-- ALTER TABLE tb_document ALTER COLUMN review_status SET DEFAULT 'PENDING';

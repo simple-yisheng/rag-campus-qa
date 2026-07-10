@@ -10,6 +10,7 @@ import com.rag.campus.security.JwtUtil;
 import com.rag.campus.service.UserService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -98,7 +99,12 @@ public class UserServiceImpl implements UserService {
 
     @Override
     public User getCurrentUser() {
-        String username = SecurityContextHolder.getContext().getAuthentication().getName();
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null || !authentication.isAuthenticated()) {
+            return null;
+        }
+
+        String username = authentication.getName();
         if (username == null || "anonymousUser".equals(username)) {
             return null;
         }

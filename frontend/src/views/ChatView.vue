@@ -2,7 +2,7 @@
 import { ref, nextTick, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
-import { ask, getHistory, getSessions, type AskResponse } from '../api/chat'
+import { askStream, getHistory, getSessions, type AskResponse, type SourceInfo } from '../api/chat'
 import { getDocumentContent, type DocumentContent } from '../api/document'
 import PdfViewer from '../components/PdfViewer.vue'
 import { marked } from 'marked'
@@ -31,6 +31,7 @@ interface ChatMessage {
 const messages = ref<ChatMessage[]>([])
 const inputText = ref('')
 const loading = ref(false)
+const streaming = ref(false)
 const messageContainer = ref<HTMLElement | null>(null)
 const messageCache = new Map<string, ChatMessage[]>()
 const switching = ref(false)
@@ -96,33 +97,53 @@ async function sendMessage() {
   inputText.value = ''
   messages.value.push({ role: 'user', content: text })
 
+  // 先插入一条空的 assistant 消息，后续逐字填充
+  const msgIndex = messages.value.length
+  messages.value.push({ role: 'assistant', content: '', sources: [] })
+  scrollToBottom()
+
   loading.value = true
-  try {
-    // 新对话首次提问不传 sessionId，由后端生成
-    const res = await ask(isNew ? '' : activeId.value, text)
+  streaming.value = true
 
-    // 新对话：用后端返回的 sessionId 创建会话
-    if (isNew && res.sessionId) {
-      activeId.value = res.sessionId
-      const title = text.length > 15 ? text.slice(0, 15) + '...' : text
-      conversations.value.unshift({ id: res.sessionId, title })
+  await askStream(
+    isNew ? '' : activeId.value,
+    text,
+    {
+      onToken(token: string) {
+        if (streaming.value) streaming.value = false
+        messages.value[msgIndex].content += token
+        scrollToBottom()
+      },
+      onSources(sessionId: string, sources: SourceInfo[]) {
+        messages.value[msgIndex].sources = sources
+        // 新对话：用后端返回的 sessionId 创建会话
+        if (isNew && sessionId) {
+          activeId.value = sessionId
+          const title = text.length > 15 ? text.slice(0, 15) + '...' : text
+          conversations.value.unshift({ id: sessionId, title })
+        }
+      },
+      onDone(fullAnswer: string) {
+        messages.value[msgIndex].content = fullAnswer
+        streaming.value = false
+        loading.value = false
+        scrollToBottom()
+      },
+      onError(msg: string) {
+        streaming.value = false
+        if (messages.value[msgIndex].content) {
+          messages.value[msgIndex].content += '\n\n*[流中断: ' + msg + ']*'
+        } else {
+          messages.value[msgIndex].content = '抱歉，请求失败: ' + msg
+        }
+        loading.value = false
+        if (isNew) {
+          messages.value.pop()
+          messages.value.pop()
+        }
+      }
     }
-
-    messages.value.push({
-      role: 'assistant',
-      content: res.answer,
-      sources: res.sources
-    })
-  } catch (e: any) {
-    MessagePlugin.error(e?.response?.data?.errorMsg || '请求失败，请稍后重试')
-    // 新对话发送失败，清空刚加的消息
-    if (isNew) {
-      messages.value = []
-    }
-  } finally {
-    loading.value = false
-    scrollToBottom()
-  }
+  )
 }
 
 function scrollToBottom() {
@@ -143,6 +164,7 @@ const drawerHighlightSnippet = ref('')
 const drawerTargetChunkIndex = ref<number | null>(null)
 const drawerContentRef = ref<HTMLElement | null>(null)
 const drawerDocumentId = computed(() => drawerPdfSource.value?.documentId || drawerDoc.value?.documentId)
+const isDrawerMd = computed(() => drawerDoc.value?.fileType === 'MD')
 
 async function viewSource(src: AskResponse['sources'][number]) {
   drawerVisible.value = true
@@ -152,13 +174,18 @@ async function viewSource(src: AskResponse['sources'][number]) {
   drawerHighlightSnippet.value = src.snippet || ''
   drawerTargetChunkIndex.value = typeof src.chunkIndex === 'number' ? src.chunkIndex : null
 
-  if ((src.fileType === 'PDF' || src.pageStart) && src.pageStart) {
+  const isPdf = src.fileType === 'PDF'
+  const isWord = src.fileType === 'DOCX' || src.fileType === 'DOC'
+
+  // PDF 或 Word 文档 → 使用 PdfViewer（后端已通过 LibreOffice 将 Word 转为 PDF 预览）
+  if (isPdf || isWord) {
     drawerMode.value = 'pdf'
     drawerPdfSource.value = src
     drawerLoading.value = false
     return
   }
 
+  // TXT / MD 等纯文本文档 → 文本降级模式
   drawerMode.value = 'text'
   try {
     drawerDoc.value = await getDocumentContent(src.documentId)
@@ -423,15 +450,15 @@ const suggestedQuestions = [
                     <t-link theme="primary" hover="color" @click="viewSource(src)">
                       《{{ src.title }}》
                     </t-link>
-                    <span class="ds-source-score">匹配度 {{ (src.score * 100).toFixed(0) }}%</span>
+                    <span class="ds-source-score">相关度 {{ (src.score * 100).toFixed(0) }}%</span>
                   </div>
                 </div>
               </div>
             </div>
           </div>
 
-          <!-- 加载中 -->
-          <div v-if="loading" class="ds-message assistant">
+          <!-- 加载中（首 token 到达前） -->
+          <div v-if="loading && !streaming" class="ds-message assistant">
             <div class="ds-msg-inner">
               <div class="ds-msg-avatar">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
@@ -504,11 +531,15 @@ const suggestedQuestions = [
 
       <div v-else-if="drawerDoc && !drawerLoading" ref="drawerContentRef" class="source-drawer-body">
         <div class="source-drawer-meta">
-          <span>全文内容</span>
+          <span>全文内容 <t-tag v-if="isDrawerMd" size="small" theme="primary" variant="light">Markdown</t-tag></span>
           <span v-if="drawerTargetChunkIndex !== null">定位片段 #{{ drawerTargetChunkIndex + 1 }}</span>
         </div>
 
-        <div v-if="drawerDoc.content" class="source-document-text">
+        <!-- Markdown 文件：marked 渲染为 HTML -->
+        <div v-if="isDrawerMd && drawerDoc.content" class="source-document-text source-md" v-html="renderMarkdown(drawerDoc.content)" />
+
+        <!-- 纯文本文件：原样展示 + 关键词高亮 -->
+        <div v-else-if="drawerDoc.content" class="source-document-text">
           <template v-for="(segment, index) in drawerContentSegments" :key="index">
             <mark v-if="segment.highlight" class="source-hit">{{ segment.text }}</mark>
             <span v-else>{{ segment.text }}</span>
@@ -901,8 +932,11 @@ const suggestedQuestions = [
 
 /* Markdown 表格渲染 */
 .ds-msg-text :deep(table) {
+  display: block;
   border-collapse: collapse;
   width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
   margin: 10px 0;
   font-size: 14px;
 }
@@ -1041,4 +1075,38 @@ const suggestedQuestions = [
   text-align: center;
   font-size: 14px;
 }
+
+/* 参考资料抽屉 — Markdown 渲染样式 */
+.source-md :deep(h1) { font-size: 1.25em; margin: 16px 0 8px; padding-bottom: 6px; border-bottom: 1px solid #eee; }
+.source-md :deep(h2) { font-size: 1.12em; margin: 14px 0 6px; }
+.source-md :deep(h3) { font-size: 1.05em; margin: 10px 0 4px; }
+.source-md :deep(p) { margin: 6px 0; line-height: 1.8; }
+.source-md :deep(ul), .source-md :deep(ol) { padding-left: 22px; margin: 6px 0; }
+.source-md :deep(li) { margin: 3px 0; line-height: 1.7; }
+.source-md :deep(code) {
+  background: #f4f4f4; padding: 2px 6px; border-radius: 4px;
+  font-size: 13px; font-family: ui-monospace, Consolas, monospace;
+}
+.source-md :deep(pre) {
+  background: #f8f8f8; padding: 12px 16px; border-radius: 8px; overflow-x: auto; margin: 8px 0;
+}
+.source-md :deep(pre code) { background: none; padding: 0; }
+.source-md :deep(table) {
+  border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 14px;
+}
+.source-md :deep(th) {
+  background: #f0f5ff; border: 1px solid #d5dce9; padding: 8px 14px;
+  text-align: left; font-weight: 600; color: #1a1a1a; white-space: nowrap;
+}
+.source-md :deep(td) {
+  border: 1px solid #e5e7eb; padding: 7px 14px; color: #333;
+}
+.source-md :deep(tr:nth-child(even)) td { background: #fafbfc; }
+.source-md :deep(blockquote) {
+  border-left: 3px solid #0052d9; padding: 8px 16px; margin: 10px 0;
+  background: #f5f8ff; color: #555;
+}
+.source-md :deep(hr) { border: none; border-top: 1px solid #e5e7eb; margin: 16px 0; }
+.source-md :deep(strong) { font-weight: 600; color: #1a1a1a; }
+.source-md :deep(a) { color: #0052d9; }
 </style>

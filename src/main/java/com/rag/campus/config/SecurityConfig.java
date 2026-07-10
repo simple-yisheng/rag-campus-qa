@@ -1,6 +1,7 @@
 package com.rag.campus.config;
 
 import com.rag.campus.security.JwtAuthFilter;
+import jakarta.servlet.DispatcherType;
 import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -35,6 +36,8 @@ public class SecurityConfig {
                 .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 // 路由权限
                 .authorizeHttpRequests(auth -> auth
+                        // SSE 使用 Servlet 异步派发；响应已开始后不能再触发二次鉴权/错误页鉴权
+                        .dispatcherTypeMatchers(DispatcherType.ASYNC, DispatcherType.ERROR).permitAll()
                         // 认证接口公开
                         .requestMatchers("/api/auth/**").permitAll()
                         // 静态资源公开（SPA 前端）
