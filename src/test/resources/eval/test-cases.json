@@ -1,0 +1,300 @@
+{
+  "description": "RAG 检索质量评测数据集 — 基于西北工业大学真实校园规章文档",
+  "version": "1.0",
+  "created": "2026-07-12",
+  "testCases": [
+    {
+      "id": 1,
+      "category": "POLICY",
+      "difficulty": "easy",
+      "question": "考试迟到多久会被取消考试资格？",
+      "relevantDocTitles": ["关于印发《西北工业大学本科生考试管理办法》的通知"],
+      "expectedAnswerContains": ["15分钟", "迟到"],
+      "note": "单文档直接查找"
+    },
+    {
+      "id": 2,
+      "category": "POLICY",
+      "difficulty": "easy",
+      "question": "考试作弊会受到什么处分？",
+      "relevantDocTitles": ["关于印发《西北工业大学本科生考试管理办法》的通知"],
+      "expectedAnswerContains": ["留校察看", "开除学籍", "警告", "零分", "违纪"],
+      "note": "单文档枚举类问题"
+    },
+    {
+      "id": 3,
+      "category": "POLICY",
+      "difficulty": "medium",
+      "question": "学生在考试中夹带资料抄袭和请人代考，处理结果有什么不同？",
+      "relevantDocTitles": ["关于印发《西北工业大学本科生考试管理办法》的通知"],
+      "expectedAnswerContains": ["夹带", "留校察看", "代考", "开除学籍"],
+      "note": "同一文档内需要区分不同作弊类型的处罚级别"
+    },
+    {
+      "id": 4,
+      "category": "POLICY",
+      "difficulty": "medium",
+      "question": "什么情况下可以免修大学英语课程？",
+      "relevantDocTitles": ["关于印发《西北工业大学本科生考试管理办法》的通知"],
+      "expectedAnswerContains": ["雅思", "6.5", "托福", "95", "免修"],
+      "note": "条件类查询，需要精确数字"
+    },
+    {
+      "id": 5,
+      "category": "POLICY",
+      "difficulty": "medium",
+      "question": "考试成绩有异议，应该在什么时间内申请复核？",
+      "relevantDocTitles": ["关于印发《西北工业大学本科生考试管理办法》的通知"],
+      "expectedAnswerContains": ["15个工作日", "寒暑假", "复核"],
+      "note": "流程类+时间限制"
+    },
+    {
+      "id": 6,
+      "category": "POLICY",
+      "difficulty": "medium",
+      "question": "一次考试作弊和两次考试作弊的处理结果有什么不同？",
+      "relevantDocTitles": ["关于印发《西北工业大学本科生考试管理办法》的通知"],
+      "expectedAnswerContains": ["两次", "累计", "开除"],
+      "note": "累犯规则"
+    },
+    {
+      "id": 7,
+      "category": "ACADEMIC",
+      "difficulty": "easy",
+      "question": "材料学院的综合测评分数怎么计算？",
+      "relevantDocTitles": ["材料学院本科生综合测评实施细则（2026版）"],
+      "expectedAnswerContains": ["G1", "G2", "0.8", "0.1", "课程", "思想品德"],
+      "note": "公式类问题"
+    },
+    {
+      "id": 8,
+      "category": "ACADEMIC",
+      "difficulty": "medium",
+      "question": "材料学院和软件学院的综测计算方式有什么区别？",
+      "relevantDocTitles": [
+        "材料学院本科生综合测评实施细则（2026版）",
+        "西北工业大学软件学院本科生综合素质测评办法（2024版）"
+      ],
+      "expectedAnswerContains": ["0.8", "0.1", "G1", "G2", "材料", "软件"],
+      "note": "跨文档对比，核心考察多文档综合"
+    },
+    {
+      "id": 9,
+      "category": "ACADEMIC",
+      "difficulty": "easy",
+      "question": "发表一篇发明专利在综测中能加多少分？",
+      "relevantDocTitles": ["材料学院本科生综合测评实施细则（2026版）"],
+      "expectedAnswerContains": ["100", "申请", "20", "授权", "80"],
+      "note": "特定加分项精确数字"
+    },
+    {
+      "id": 10,
+      "category": "ACADEMIC",
+      "difficulty": "medium",
+      "question": "什么行为会导致综测一票否决？",
+      "relevantDocTitles": [
+        "材料学院本科生综合测评实施细则（2026版）",
+        "西北工业大学软件学院本科生综合素质测评办法（2024版）"
+      ],
+      "expectedAnswerContains": ["思想品德", "违法违纪", "学术不端", "打架斗殴", "赌博酗酒", "留校察看", "记过", "意识形态"],
+      "note": "修正：实际问答中两个学院的细则都有一票否决条款，共性问题应两份都检索到。真实Embedding验证：材料88%+软件86%"
+    },
+    {
+      "id": 11,
+      "category": "ACADEMIC",
+      "difficulty": "hard",
+      "question": "ACM-ICPC竞赛在综测中算多少分？竞赛评级是A1还是A2？",
+      "relevantDocTitles": [
+        "附件-西北工业大学认定的本科生学科竞赛项目名录（2026年版）",
+        "材料学院本科生综合测评实施细则（2026版）"
+      ],
+      "expectedAnswerContains": ["A1", "ACM", "国际", "系数"],
+      "note": "跨文档：需要从名录查级别，从综测细则查对应分数"
+    },
+    {
+      "id": 12,
+      "category": "ACADEMIC",
+      "difficulty": "medium",
+      "question": "西北工业大学认定的A1类学科竞赛有哪些？",
+      "relevantDocTitles": ["附件-西北工业大学认定的本科生学科竞赛项目名录（2026年版）"],
+      "expectedAnswerContains": ["中国国际大学生创新大赛", "挑战杯", "数学建模", "ACM", "A1", "91"],
+      "note": "名录类查询，考察表格/列表内容的检索"
+    },
+    {
+      "id": 13,
+      "category": "ACADEMIC",
+      "difficulty": "easy",
+      "question": "软件工程专业需要修满多少学分才能毕业？",
+      "relevantDocTitles": ["2021级信息大类-软件工程专业培养方案"],
+      "expectedAnswerContains": ["167", "通识", "82.5", "学科专业", "84.5"],
+      "note": "精确数字查询"
+    },
+    {
+      "id": 14,
+      "category": "ACADEMIC",
+      "difficulty": "medium",
+      "question": "软件工程专业最长可以在校学习几年？",
+      "relevantDocTitles": ["2021级信息大类-软件工程专业培养方案"],
+      "expectedAnswerContains": ["6年", "3年", "弹性", "标准学制4年"],
+      "note": "弹性学制规则"
+    },
+    {
+      "id": 15,
+      "category": "ACADEMIC",
+      "difficulty": "hard",
+      "question": "软件学院的综测中，GPA和'厚基础'课程分别占多少权重？哪些课程属于'厚基础'？",
+      "relevantDocTitles": ["西北工业大学软件学院本科生综合素质测评办法（2024版）"],
+      "expectedAnswerContains": ["0.8", "0.2", "微积分", "线性代数", "数据结构", "操作系统", "计算机网络"],
+      "note": "复合问题：权重+课程列表"
+    },
+    {
+      "id": 16,
+      "category": "GUIDE",
+      "difficulty": "easy",
+      "question": "长安校区的宿舍床多大？",
+      "relevantDocTitles": ["瓜兵速成指南（2025版）"],
+      "expectedAnswerContains": ["1.9米", "2.0米", "2.1米", "2.2米", "星天苑", "海天苑"],
+      "note": "生活类直接查询"
+    },
+    {
+      "id": 17,
+      "category": "GUIDE",
+      "difficulty": "easy",
+      "question": "西北工业大学GPA是怎么换算的？95分对应多少GPA？",
+      "relevantDocTitles": ["瓜兵速成指南（2025版）"],
+      "expectedAnswerContains": ["4.1", "95", "GPA"],
+      "note": "精确数值查询"
+    },
+    {
+      "id": 18,
+      "category": "GUIDE",
+      "difficulty": "medium",
+      "question": "学校的校园网怎么收费？最多能连几台设备？",
+      "relevantDocTitles": ["瓜兵速成指南（2025版）"],
+      "expectedAnswerContains": ["50元", "4台", "NWPU", "不限量"],
+      "note": "实用信息复合查询"
+    },
+    {
+      "id": 19,
+      "category": "GUIDE",
+      "difficulty": "easy",
+      "question": "英语四六级考试的报名网址是什么？报名流程是怎样的？",
+      "relevantDocTitles": ["全国大学英语四、六级考试报名操作手册"],
+      "expectedAnswerContains": ["cet-kw.neea.edu.cn", "陕西", "虚拟校区", "610022"],
+      "note": "流程+网址查询"
+    },
+    {
+      "id": 20,
+      "category": "SCHOLARSHIP",
+      "difficulty": "easy",
+      "question": "航空工业奖学金多少钱？有什么申请条件？",
+      "relevantDocTitles": ["本科生专项奖学金设置及评选摘要（2023-2024）"],
+      "expectedAnswerContains": ["10000", "6000", "航空工业", "30%", "省部级", "二年级"],
+      "note": "特定奖学金查询"
+    },
+    {
+      "id": 21,
+      "category": "SCHOLARSHIP",
+      "difficulty": "medium",
+      "question": "中航技奖学金和航空工业奖学金可以同时申请吗？",
+      "relevantDocTitles": [
+        "关于做好2023-2024学年本科生专项奖学金评选工作的通知（2023-2024）",
+        "本科生专项奖学金设置及评选摘要（2023-2024）"
+      ],
+      "expectedAnswerContains": ["不能", "不可", "兼得"],
+      "note": "跨文档条件判断"
+    },
+    {
+      "id": 22,
+      "category": "SCHOLARSHIP",
+      "difficulty": "hard",
+      "question": "三星奖学金和国家奖学金能同时拿吗？三星奖学金面向哪些学院？",
+      "relevantDocTitles": [
+        "关于做好2022-2023学年\"三星\"社会专项奖学金评选工作的通知"
+      ],
+      "expectedAnswerContains": ["不能", "不可", "材料", "机电", "电子信息", "自动化", "计算机", "软件", "微电子", "5000元"],
+      "note": "三星专项问题以三星通知为主力文档（含兼得规则+学院名单）。通用奖学金通知虽也有兼得规则但属补充材料，非必需命中。真实Embedding验证：三星通知93%命中"
+    },
+    {
+      "id": 23,
+      "category": "SCHOLARSHIP",
+      "difficulty": "medium",
+      "question": "本科生有哪些专项奖学金可以选择？",
+      "relevantDocTitles": ["本科生专项奖学金设置及评选摘要（2023-2024）"],
+      "expectedAnswerContains": ["航空工业", "中航技", "吴亚军", "科为", "小米", "华萌", "铂力特", "宁波未来之星"],
+      "note": "枚举类，考察表格提取能力"
+    },
+    {
+      "id": 24,
+      "category": "SCHOLARSHIP",
+      "difficulty": "medium",
+      "question": "吴亚军奖学金和科为奖学金可以同时申请吗？为什么？",
+      "relevantDocTitles": [
+        "关于做好2023-2024学年本科生专项奖学金评选工作的通知（2023-2024）",
+        "本科生专项奖学金设置及评选摘要（2023-2024）"
+      ],
+      "expectedAnswerContains": ["不可以", "不可", "同一出资方", "吴亚军", "科为"],
+      "note": "同一出资方不可兼得的规则"
+    },
+    {
+      "id": 25,
+      "category": "OTHER",
+      "difficulty": "easy",
+      "question": "男生体测1000米跑多少秒及格？",
+      "relevantDocTitles": ["体测各项评分标准"],
+      "expectedAnswerContains": ["4'32", "4分32", "大一", "大二"],
+      "note": "精确数字查询"
+    },
+    {
+      "id": 26,
+      "category": "OTHER",
+      "difficulty": "medium",
+      "question": "体测中立定跳远男生和女生的及格标准分别是多少？",
+      "relevantDocTitles": ["体测各项评分标准"],
+      "expectedAnswerContains": ["208", "151", "男生", "女生", "厘米"],
+      "note": "对比数值查询"
+    },
+    {
+      "id": 27,
+      "category": "OTHER",
+      "difficulty": "easy",
+      "question": "学生网上评教中'优秀'评价的比例有什么限制？",
+      "relevantDocTitles": ["关于开展2024-2025学年秋季学期课程学生网上评教的通知"],
+      "expectedAnswerContains": ["20%", "不超过", "优秀"],
+      "note": "精确百分比查询"
+    },
+    {
+      "id": 28,
+      "category": "OTHER",
+      "difficulty": "medium",
+      "question": "寒假社会实践活动有什么要求？需要写多少字的报告？",
+      "relevantDocTitles": ["关于开展2025年寒假大学生社会实践活动的通知"],
+      "expectedAnswerContains": ["5天", "1500字", "3000字", "6人", "分散", "集中"],
+      "note": "多条件复合查询"
+    },
+    {
+      "id": 29,
+      "category": "SCHOLARSHIP",
+      "difficulty": "hard",
+      "question": "大三软件学院学生，综合排名前20%，想申请奖学金但家庭经济比较困难，有什么推荐的奖学金？申请时需要注意什么限制？",
+      "relevantDocTitles": [
+        "本科生专项奖学金设置及评选摘要（2023-2024）",
+        "关于做好2023-2024学年本科生专项奖学金评选工作的通知（2023-2024）"
+      ],
+      "expectedAnswerContains": ["小米", "5000", "困难", "兼得", "不能", "宁波", "华萌", "国家奖学金"],
+      "note": "情景综合题：需要综合多个奖学金条件和限制规则给出推荐"
+    },
+    {
+      "id": 30,
+      "category": "ACADEMIC",
+      "difficulty": "hard",
+      "question": "材料学院学生获得省级学科竞赛一等奖、考了雅思7分、担任班长，这些在综测中分别能加多少分？",
+      "relevantDocTitles": [
+        "材料学院本科生综合测评实施细则（2026版）",
+        "附件-西北工业大学认定的本科生学科竞赛项目名录（2026年版）"
+      ],
+      "expectedAnswerContains": ["省级", "一等奖", "80", "雅思", "7", "10", "班长", "30", "25", "竞赛"],
+      "note": "多维度打分综合题，需跨文档查竞赛认定等级"
+    }
+  ]
+}
