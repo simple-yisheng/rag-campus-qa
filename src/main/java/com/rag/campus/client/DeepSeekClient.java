@@ -7,7 +7,7 @@ import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
@@ -119,11 +119,9 @@ public class DeepSeekClient {
         headers.set("Authorization", "Bearer " + apiKey);
 
         try {
-            // 使用 execute + ResponseExtractor 实现流式读取
-            RestTemplate streamingTemplate = new RestTemplate();
-            SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-            factory.setBufferRequestBody(false);
-            streamingTemplate.setRequestFactory(factory);
+            // 使用 JdkClientHttpRequestFactory 实现流式读取
+            // （java.net.http.HttpClient 原生支持流式，无需 setBufferRequestBody）
+            RestTemplate streamingTemplate = new RestTemplate(new JdkClientHttpRequestFactory());
 
             StringBuilder fullAnswer = new StringBuilder();
 

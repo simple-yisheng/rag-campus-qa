@@ -1,0 +1,91 @@
+# ==================== 测试环境配置 ====================
+# 使用 H2 内存数据库，避免污染真实 MySQL
+# 向量存储强制使用 memory 模式
+# 外部 API（DeepSeek/DashScope）配置假 Key 防止误调用
+
+spring:
+  datasource:
+    driver-class-name: org.h2.Driver
+    url: jdbc:h2:mem:testdb;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/schema-h2.sql
+
+  # 测试环境禁用中间件自动启动
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.amqp.RabbitAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+
+  # 禁用消息监听
+  rabbitmq:
+    listener:
+      auto-startup: false
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      table-prefix: tb_
+
+# ↓↓↓ 外部 API 全部用假 Key，避免测试时真实调用 ↓↓↓
+deepseek:
+  api-key: test-deepseek-key-placeholder
+  base-url: https://api.deepseek.com
+  chat-model: deepseek-chat
+
+embedding:
+  provider: local
+  dashscope:
+    api-key: test-dashscope-key-placeholder
+    base-url: https://dashscope.aliyuncs.com
+    model: text-embedding-v3
+
+minio:
+  endpoint: http://localhost:9000
+  access-key: test-minio-key
+  secret-key: test-minio-secret
+  bucket: test-bucket
+
+office:
+  preview:
+    enabled: false
+    libreoffice-path: soffice
+    timeout-seconds: 10
+
+rag:
+  chunk:
+    size: 800
+    overlap: 200
+  retrieval:
+    top-k: 12
+    min-score: 0.55
+  conversation:
+    max-history: 10
+    ttl-hours: 24
+  vector:
+    store: memory
+  vision:
+    enabled: false
+    model: qwen-vl-plus
+    max-images: 6
+
+milvus:
+  host: localhost
+  port: 19530
+  database: default
+  collection: test_collection
+  metric-type: COSINE
+  dimension: 1024
+  index-type: IVF_FLAT
+  nlist: 128
+  nprobe: 16
+
+jwt:
+  secret: test-jwt-secret-key-for-unit-testing-only-32bytes
+  expiration: 3600000
