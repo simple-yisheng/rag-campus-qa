@@ -13,6 +13,7 @@ import com.rag.campus.service.impl.RagServiceImpl;
 import com.rag.campus.support.VectorStore;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
@@ -22,61 +23,77 @@ import java.io.InputStream;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 /**
- * RAG 检索质量评测器
+ * RAG 检索后处理管道评测器。
  * <p>
- * 基于 test-cases.json 中的 30 条评测用例，对 RagServiceImpl 的检索管道做全量评测。
+ * <b>Mode: keyword-mock retrieval — evaluating rerank / filter / diversity pipeline only.</b>
+ * 真实向量召回（Milvus / DashScope Embedding）的效果会显著优于这里的模拟结果。
+ * <p>
+ * 基于 test-cases.json 中的 30 条评测用例，对 RagServiceImpl 的检索后处理管道做全量评测。
  * <p>
  * 设计思路：
- * 1. 使用 KeyWordVectorStore（关键词匹配）替代真实的向量语义检索，
- *    从而消除 Embedding API 的不确定性，聚焦测试检索后处理管道（关键词加权、
- *    标题匹配、阈值过滤、多样性截断）。
- * 2. 文档内容基于真实文档提取的关键事实编写，确保测试结果有实际意义。
- * 3. 输出 Recall@5、Precision@5、MRR、Hit Rate 四项指标。
+ * 1. 使用 {@link KeywordVectorStore}（字符级 n-gram 关键词匹配）替代真实的 Embedding 语义检索，
+ *    消除 API 不确定性，聚焦测试检索后处理管道（关键词加权、标题匹配、阈值过滤、多样性截断）。
+ * 2. 文档内容基于真实校园规章文档的关键事实编写。
+ * 3. 输出 Recall@1/3/5/10、Precision@5、MRR、HitRate@5。
  *
  * <pre>
  *   运行方式：
- *     mvn test -Dtest=RetrievalEvaluatorTest
+ *     mvn test -Dtest=RetrievalPipelineEvaluatorTest
  * </pre>
  */
-@DisplayName("RAG 检索质量评测")
-class RetrievalEvaluatorTest {
+@DisplayName("RAG 检索管道评测（关键词模拟召回）")
+class RetrievalPipelineEvaluatorTest {
 
     private static final String TEST_CASES_PATH = "eval/test-cases.json";
-    private static final int TOP_K = 5;
+    private static final int[] K_VALUES = {1, 3, 5, 10};
+    private static final int MAX_HITS = 12;
+
+    private static final Set<String> VALID_CATEGORIES = Set.of("POLICY", "ACADEMIC", "GUIDE", "SCHOLARSHIP", "OTHER");
+    private static final Set<String> VALID_DIFFICULTIES = Set.of("easy", "medium", "hard");
 
     private static List<TestCase> testCases;
     private static RagServiceImpl ragService;
     private static KeywordVectorStore keywordStore;
+    private static Set<String> allDocTitles;
 
     // ==================== 数据模型 ====================
 
     record TestCase(int id, String category, String difficulty, String question,
-                    List<String> relevantDocTitles, List<String> expectedAnswerContains, String note) {
+                    List<String> relevantDocTitles, String note) {
     }
 
     record EvalResult(int id, String category, String difficulty, String question,
                       List<String> retrievedTitles, List<String> relevantTitles,
                       int firstHitRank, boolean found) {
-        double recallAt5() {
+
+        double recallAtK(int k) {
             if (relevantTitles.isEmpty()) return 1.0;
-            long hit = retrievedTitles.stream().filter(relevantTitles::contains).count();
+            List<String> topK = retrievedTitles.subList(0, Math.min(k, retrievedTitles.size()));
+            long hit = topK.stream().filter(relevantTitles::contains).count();
             return (double) hit / relevantTitles.size();
         }
 
-        double precisionAt5() {
-            if (retrievedTitles.isEmpty()) return 0.0;
-            long hit = retrievedTitles.stream().filter(relevantTitles::contains).count();
-            return (double) hit / retrievedTitles.size();
+        double precisionAtK(int k) {
+            List<String> topK = retrievedTitles.subList(0, Math.min(k, retrievedTitles.size()));
+            if (topK.isEmpty()) return 0.0;
+            long hit = topK.stream().filter(relevantTitles::contains).count();
+            return (double) hit / topK.size();
         }
 
         double reciprocalRank() {
             return firstHitRank > 0 ? 1.0 / firstHitRank : 0.0;
+        }
+
+        boolean hitAt5() {
+            List<String> top5 = retrievedTitles.subList(0, Math.min(5, retrievedTitles.size()));
+            return top5.stream().anyMatch(relevantTitles::contains);
         }
     }
 
@@ -87,13 +104,15 @@ class RetrievalEvaluatorTest {
         testCases = loadTestCases();
         keywordStore = new KeywordVectorStore();
         loadDocuments(keywordStore);
+        allDocTitles = keywordStore.documents.values().stream()
+                .map(Document::getTitle).collect(Collectors.toSet());
 
         ragService = buildRagService(keywordStore);
     }
 
     @SuppressWarnings("unchecked")
     static List<TestCase> loadTestCases() throws Exception {
-        try (InputStream is = RetrievalEvaluatorTest.class.getClassLoader()
+        try (InputStream is = RetrievalPipelineEvaluatorTest.class.getClassLoader()
                 .getResourceAsStream(TEST_CASES_PATH)) {
             assert is != null : "评测用例文件未找到: " + TEST_CASES_PATH;
             String json = new String(is.readAllBytes(), StandardCharsets.UTF_8);
@@ -108,7 +127,6 @@ class RetrievalEvaluatorTest {
                         obj.getStr("difficulty"),
                         obj.getStr("question"),
                         obj.getBeanList("relevantDocTitles", String.class),
-                        obj.getBeanList("expectedAnswerContains", String.class),
                         obj.getStr("note")
                 ));
             }
@@ -116,12 +134,7 @@ class RetrievalEvaluatorTest {
         }
     }
 
-    /**
-     * 构建 RagServiceImpl，Mock 掉外部依赖，注入 KeyWordVectorStore。
-     * Conversation 历史等不参与检索的依赖全部 Mock 掉。
-     */
     static RagServiceImpl buildRagService(KeywordVectorStore store) {
-        // Mock 外部依赖
         EmbeddingClient embeddingClient = mock(EmbeddingClient.class);
         when(embeddingClient.embed(anyString())).thenReturn(new float[]{0.1f, 0.2f, 0.3f});
 
@@ -139,18 +152,11 @@ class RetrievalEvaluatorTest {
         ConversationMessageMapper messageMapper = mock(ConversationMessageMapper.class);
 
         RagServiceImpl service = new RagServiceImpl(
-                null,               // deepSeekClient (检索评测不需要 LLM)
-                embeddingClient,
-                store,              // ← 注入关键词匹配向量库
-                sessionMapper,
-                messageMapper,
-                documentMapper,
-                redisTemplate,
-                null                // userService (评测不需要)
-        );
+                null, embeddingClient, store,
+                sessionMapper, messageMapper, documentMapper,
+                redisTemplate, null);
 
-        // 注入 @Value 字段
-        ReflectionTestUtils.setField(service, "topK", TOP_K);
+        ReflectionTestUtils.setField(service, "topK", MAX_HITS);
         ReflectionTestUtils.setField(service, "minScore", 0.55);
         ReflectionTestUtils.setField(service, "maxHistory", 10);
         ReflectionTestUtils.setField(service, "ttlHours", 24);
@@ -158,25 +164,126 @@ class RetrievalEvaluatorTest {
         return service;
     }
 
-    // ==================== 评测入口 ====================
+    // ==================== 数据集自身校验 ====================
+
+    @Nested
+    @DisplayName("数据集完整性校验")
+    class DataValidation {
+
+        @Test
+        @DisplayName("testCases 数量应为 30")
+        void shouldHave30Cases() {
+            assertThat(testCases).hasSize(30);
+        }
+
+        @Test
+        @DisplayName("id 应唯一")
+        void shouldHaveUniqueIds() {
+            Set<Integer> ids = new HashSet<>();
+            for (TestCase tc : testCases) {
+                assertThat(ids.add(tc.id()))
+                        .as("重复 ID: " + tc.id()).isTrue();
+            }
+        }
+
+        @Test
+        @DisplayName("question 不应为空")
+        void shouldHaveNonEmptyQuestion() {
+            for (TestCase tc : testCases) {
+                assertThat(tc.question())
+                        .as("用例 #" + tc.id() + " 的 question 为空").isNotBlank();
+            }
+        }
+
+        @Test
+        @DisplayName("relevantDocTitles 不应为空")
+        void shouldHaveNonEmptyRelevantTitles() {
+            for (TestCase tc : testCases) {
+                assertThat(tc.relevantDocTitles())
+                        .as("用例 #" + tc.id() + " 的 relevantDocTitles 为空")
+                        .isNotEmpty();
+            }
+        }
+
+        @Test
+        @DisplayName("每个 relevantDocTitle 都能在模拟文档中找到")
+        void shouldAllTitlesExistInMockDocuments() {
+            for (TestCase tc : testCases) {
+                for (String title : tc.relevantDocTitles()) {
+                    assertThat(allDocTitles)
+                            .as("用例 #" + tc.id() + " 引用了不存在的文档: '" + title + "'")
+                            .contains(title);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("difficulty 只能是 easy / medium / hard")
+        void shouldHaveValidDifficulty() {
+            for (TestCase tc : testCases) {
+                assertThat(tc.difficulty())
+                        .as("用例 #" + tc.id() + " 的 difficulty 无效: " + tc.difficulty())
+                        .isIn(VALID_DIFFICULTIES);
+            }
+        }
+
+        @Test
+        @DisplayName("category 只能是已有分类")
+        void shouldHaveValidCategory() {
+            for (TestCase tc : testCases) {
+                assertThat(tc.category())
+                        .as("用例 #" + tc.id() + " 的 category 无效: " + tc.category())
+                        .isIn(VALID_CATEGORIES);
+            }
+        }
+    }
+
+    // ==================== 检索管道评测 ====================
 
     @Test
-    @DisplayName("30 条评测用例全量检索质量评估")
+    @DisplayName("30 条用例全量检索管道评估")
     void evaluateAll() throws Exception {
+        List<EvalResult> results = runAllEvaluations();
+
+        // ── 各 K 值指标 ──
+        Map<Integer, Double> recallByK = new LinkedHashMap<>();
+        for (int k : K_VALUES) {
+            final int kk = k;
+            recallByK.put(k, results.stream().mapToDouble(r -> r.recallAtK(kk)).average().orElse(0));
+        }
+        double precisionAt5 = results.stream().mapToDouble(r -> r.precisionAtK(5)).average().orElse(0);
+        double mrr = results.stream().mapToDouble(EvalResult::reciprocalRank).average().orElse(0);
+        long hitCount = results.stream().filter(EvalResult::hitAt5).count();
+        double hitRate5 = (double) hitCount / results.size();
+
+        printReport(results, recallByK, precisionAt5, mrr, hitRate5, hitCount);
+
+        // ── 整体断言 ──
+        assertThat(hitRate5).as("整体 HitRate@5").isGreaterThanOrEqualTo(0.70);
+        assertThat(recallByK.get(5)).as("整体 Recall@5").isGreaterThanOrEqualTo(0.55);
+
+        // ── 按难度分层 ──
+        assertThat(hitRateForDifficulty(results, "easy")).as("easy HitRate@5").isGreaterThanOrEqualTo(0.85);
+        assertThat(hitRateForDifficulty(results, "medium")).as("medium HitRate@5").isGreaterThanOrEqualTo(0.65);
+        assertThat(hitRateForDifficulty(results, "hard")).as("hard HitRate@5").isGreaterThanOrEqualTo(0.40);
+
+        assertThat(recallForDifficulty(results, "easy", 5)).as("easy Recall@5").isGreaterThanOrEqualTo(0.75);
+        assertThat(recallForDifficulty(results, "hard", 5)).as("hard Recall@5").isGreaterThanOrEqualTo(0.30);
+    }
+
+    // ==================== 评测执行 ====================
+
+    private List<EvalResult> runAllEvaluations() throws Exception {
         List<EvalResult> results = new ArrayList<>();
 
         for (TestCase tc : testCases) {
-            // 1. 设置查询文本（KeyWordVectorStore.search() 用关键词匹配模拟语义检索）
-            //    同时生成 dummy 向量（检索管道需要，但实际匹配不走向量）
             keywordStore.setQuery(tc.question());
             float[] dummyVector = {0.1f, 0.2f, 0.3f};
 
-            // 2. 调用检索管道（retrieveRelevantHits 是 private 方法）
             @SuppressWarnings("unchecked")
             List<VectorStore.Hit> hits = (List<VectorStore.Hit>) invokeRetrieve(
                     ragService, tc.question(), dummyVector);
 
-            // 3. 从 hits 解析出文档标题（前 TOP_K 个去重）
             Set<String> seen = new LinkedHashSet<>();
             List<String> retrievedTitles = new ArrayList<>();
             for (VectorStore.Hit hit : hits) {
@@ -187,10 +294,9 @@ class RetrievalEvaluatorTest {
                         retrievedTitles.add(doc.getTitle());
                     }
                 }
-                if (retrievedTitles.size() >= TOP_K) break;
+                if (retrievedTitles.size() >= MAX_HITS) break;
             }
 
-            // 4. 计算排名和命中
             int firstHitRank = 0;
             for (int i = 0; i < retrievedTitles.size(); i++) {
                 if (tc.relevantDocTitles().contains(retrievedTitles.get(i))) {
@@ -204,95 +310,93 @@ class RetrievalEvaluatorTest {
                     tc.question(), retrievedTitles, tc.relevantDocTitles(),
                     firstHitRank, found));
         }
-
-        // 5. 计算指标
-        double avgRecall = results.stream().mapToDouble(EvalResult::recallAt5).average().orElse(0);
-        double avgPrecision = results.stream().mapToDouble(EvalResult::precisionAt5).average().orElse(0);
-        double mrr = results.stream().mapToDouble(EvalResult::reciprocalRank).average().orElse(0);
-        double hitRate = (double) results.stream().filter(EvalResult::found).count() / results.size();
-        long totalFound = results.stream().filter(EvalResult::found).count();
-
-        // 6. 打印报告
-        printReport(results, avgRecall, avgPrecision, mrr, hitRate, totalFound);
-
-        // 7. 按类别分组统计
-        printCategoryBreakdown(results);
-
-        // 8. 断言最低质量门槛
-        //    关键词匹配只能测管道质量的下限，实际语义检索效果会显著更好
-        //    这里断言管道不会把所有相关结果都过滤掉
-        assertThat(hitRate)
-                .as("Hit Rate: 至少命中一个相关文档的查询比例")
-                .isGreaterThanOrEqualTo(0.40);
-
-        assertThat(mrr)
-                .as("MRR: 第一个相关结果的平均倒数排名")
-                .isGreaterThanOrEqualTo(0.20);
-
-        assertThat(avgRecall)
-                .as("Recall@5: 前5条结果中相关文档的召回率")
-                .isGreaterThanOrEqualTo(0.20);
+        return results;
     }
 
     // ==================== 报告输出 ====================
 
-    private void printReport(List<EvalResult> results, double avgRecall, double avgPrecision,
-                             double mrr, double hitRate, long totalFound) {
-        System.out.println("\n" + "=".repeat(70));
-        System.out.println("  RAG 检索质量评测报告");
-        System.out.println("=".repeat(70));
+    private void printReport(List<EvalResult> results, Map<Integer, Double> recallByK,
+                             double precisionAt5, double mrr, double hitRate5, long hitCount) {
+        System.out.println("\n" + "=".repeat(72));
+        System.out.println("  RAG 检索管道评测报告");
+        System.out.println("  Mode: keyword-mock retrieval (evaluating rerank/filter/diversity pipeline only)");
+        System.out.println("  ⚠ 真实 Embedding 语义召回效果会显著优于以下模拟结果");
+        System.out.println("=".repeat(72));
         System.out.printf("  用例总数:  %d%n", results.size());
-        System.out.printf("  命中数:    %d (至少命中一个相关文档)%n", totalFound);
-        System.out.println("─".repeat(70));
-        System.out.printf("  Recall@%d:   %.2f%%%n", TOP_K, avgRecall * 100);
-        System.out.printf("  Precision@%d: %.2f%%%n", TOP_K, avgPrecision * 100);
-        System.out.printf("  MRR:       %.3f%n", mrr);
-        System.out.printf("  Hit Rate:  %.1f%%%n", hitRate * 100);
-        System.out.println("─".repeat(70));
+        System.out.printf("  HitRate@5 命中数: %d%n", hitCount);
+        System.out.println("─".repeat(72));
+        System.out.printf("  %-16s %8s%n", "Recall@1", pct(recallByK.get(1)));
+        System.out.printf("  %-16s %8s%n", "Recall@3", pct(recallByK.get(3)));
+        System.out.printf("  %-16s %8s%n", "Recall@5", pct(recallByK.get(5)));
+        System.out.printf("  %-16s %8s%n", "Recall@10", pct(recallByK.get(10)));
+        System.out.printf("  %-16s %8s%n", "Precision@5", pct(precisionAt5));
+        System.out.printf("  %-16s %8s%n", "HitRate@5", pct(hitRate5));
+        System.out.printf("  %-16s %8.3f%n", "MRR", mrr);
+        System.out.println("─".repeat(72));
 
-        // 按难度统计
+        System.out.println("  按难度分层:");
         for (String diff : List.of("easy", "medium", "hard")) {
-            List<EvalResult> subset = results.stream()
-                    .filter(r -> r.difficulty().equals(diff)).toList();
+            List<EvalResult> subset = filterByDifficulty(results, diff);
             if (subset.isEmpty()) continue;
-            double hr = (double) subset.stream().filter(EvalResult::found).count() / subset.size();
-            double rec = subset.stream().mapToDouble(EvalResult::recallAt5).average().orElse(0);
-            System.out.printf("  [%s 难度] %d 条 | Hit Rate: %.0f%% | Recall@5: %.1f%%%n",
-                    diff, subset.size(), hr * 100, rec * 100);
+            double hr = hitRateOf(subset);
+            double r1 = avgRecallAtK(subset, 1);
+            double r5 = avgRecallAtK(subset, 5);
+            System.out.printf("    [%-6s] %2d 条 | HitRate@5: %5s | Recall@1: %5s | Recall@5: %5s%n",
+                    diff, subset.size(), pct(hr), pct(r1), pct(r5));
         }
 
-        // 未命中的用例
-        List<EvalResult> misses = results.stream().filter(r -> !r.found()).toList();
+        System.out.println("  按类别:");
+        for (String cat : List.of("POLICY", "ACADEMIC", "GUIDE", "SCHOLARSHIP", "OTHER")) {
+            List<EvalResult> subset = filterByCategory(results, cat);
+            if (subset.isEmpty()) continue;
+            double hr = hitRateOf(subset);
+            double r5 = avgRecallAtK(subset, 5);
+            System.out.printf("    [%-12s] %2d 条 | HitRate@5: %5s | Recall@5: %5s%n",
+                    cat, subset.size(), pct(hr), pct(r5));
+        }
+
+        List<EvalResult> misses = results.stream().filter(r -> !r.hitAt5()).toList();
         if (!misses.isEmpty()) {
-            System.out.println("─".repeat(70));
-            System.out.println("  未命中用例:");
+            System.out.println("─".repeat(72));
+            System.out.println("  HitRate@5 未命中用例:");
             for (EvalResult r : misses) {
                 System.out.printf("    #%d [%s] %s%n", r.id(), r.difficulty(), r.question());
                 System.out.printf("       期望: %s%n", r.relevantTitles());
                 System.out.printf("       实际: %s%n", r.retrievedTitles());
             }
         }
-        System.out.println("=".repeat(70) + "\n");
+        System.out.println("=".repeat(72) + "\n");
     }
 
-    private void printCategoryBreakdown(List<EvalResult> results) {
-        System.out.println("  按类别统计:");
-        System.out.println("  ┌──────────────┬──────┬─────────┬──────────┐");
-        System.out.println("  │ 类别         │ 条数 │ Hit Rate│ Recall@5 │");
-        System.out.println("  ├──────────────┼──────┼─────────┼──────────┤");
-        for (String cat : List.of("POLICY", "ACADEMIC", "GUIDE", "SCHOLARSHIP", "OTHER")) {
-            List<EvalResult> subset = results.stream()
-                    .filter(r -> r.category().equals(cat)).toList();
-            if (subset.isEmpty()) continue;
-            double hr = (double) subset.stream().filter(EvalResult::found).count() / subset.size();
-            double rec = subset.stream().mapToDouble(EvalResult::recallAt5).average().orElse(0);
-            System.out.printf("  │ %-12s │ %4d │  %5.0f%%  │  %6.1f%% │%n",
-                    cat, subset.size(), hr * 100, rec * 100);
-        }
-        System.out.println("  └──────────────┴──────┴─────────┴──────────┘\n");
+    // ==================== 指标辅助 ====================
+
+    private static String pct(double v) { return String.format("%.1f%%", v * 100); }
+
+    private double hitRateOf(List<EvalResult> subset) {
+        return (double) subset.stream().filter(EvalResult::hitAt5).count() / subset.size();
     }
 
-    // ==================== Reflection helper ====================
+    private double avgRecallAtK(List<EvalResult> subset, int k) {
+        return subset.stream().mapToDouble(r -> r.recallAtK(k)).average().orElse(0);
+    }
+
+    private double hitRateForDifficulty(List<EvalResult> results, String diff) {
+        return hitRateOf(filterByDifficulty(results, diff));
+    }
+
+    private double recallForDifficulty(List<EvalResult> results, String diff, int k) {
+        return avgRecallAtK(filterByDifficulty(results, diff), k);
+    }
+
+    private List<EvalResult> filterByDifficulty(List<EvalResult> r, String d) {
+        return r.stream().filter(x -> x.difficulty().equals(d)).toList();
+    }
+
+    private List<EvalResult> filterByCategory(List<EvalResult> r, String c) {
+        return r.stream().filter(x -> x.category().equals(c)).toList();
+    }
+
+    // ==================== Reflection ====================
 
     private Object invokeRetrieve(RagServiceImpl service, String query, float[] vector)
             throws Exception {
@@ -302,15 +406,10 @@ class RetrievalEvaluatorTest {
         return m.invoke(service, query, vector);
     }
 
-    // ==================== 文档数据加载 ====================
+    // ==================== 模拟文档加载 ====================
 
-    /**
-     * 加载模拟文档及其分块到 KeyWordVectorStore。
-     * 内容基于真实文档提取的关键事实。
-     */
     static void loadDocuments(KeywordVectorStore store) {
-        // ---- POLICY: 考试管理办法 ----
-        long docExamId = addDoc(store, "关于印发《西北工业大学本科生考试管理办法》的通知", "POLICY",
+        addDoc(store, "关于印发《西北工业大学本科生考试管理办法》的通知", "POLICY",
                 "考试迟到15分钟以上取消考试资格，按缺考处理。考试过程需携带学生证或一卡通。",
                 "夹带资料、抄袭、传递物品、交换试卷等作弊行为给予留校察看处分。" +
                         "偷窃试卷、请人代考、组织作弊、出售考试答案等行为给予开除学籍处分。" +
@@ -320,8 +419,7 @@ class RetrievalEvaluatorTest {
                 "缺课达三分之一以上或缺交作业三分之一以上不得参加课程考核。每学期最多申请2门课程免听。",
                 "试题重复率：近三年试卷内容重复率不得超过30%。正考和补考试卷需准备2-3套等难度试题。");
 
-        // ---- ACADEMIC: 材料学院综测办法 ----
-        long docMaterialEvalId = addDoc(store, "材料学院本科生综合测评实施细则（2026版）", "ACADEMIC",
+        addDoc(store, "材料学院本科生综合测评实施细则（2026版）", "ACADEMIC",
                 "综合测评总分 G = 0.8×G1 + 0.1×G2 + 0.1×(G3+G4+G5) + G6。" +
                         "其中G1为课程学习成绩（GPA），G2为思想道德与身心素质，G3为科研创新，" +
                         "G4为全面发展，G5为公益服务，G6为违纪扣分（负值）。",
@@ -337,31 +435,24 @@ class RetrievalEvaluatorTest {
                 "综测中G2评分前30%评为90分及以上。违纪扣分：留校察看扣6分，记过扣5分，" +
                         "严重警告扣4分，警告扣3分，宿舍检查不合格扣1分。");
 
-        // ---- ACADEMIC: 软件学院综测办法 ----
         addDoc(store, "西北工业大学软件学院本科生综合素质测评办法（2024版）", "ACADEMIC",
-                // Chunk 0
                 "综合测评总分 G = 0.1×G1 + 0.8×G2 + 0.1×(G3+G4+G5) + G6。" +
                         "G1为思想政治素质（百分制，60分及格，低于60分一票否决），G2为学业成绩（GPA），" +
                         "G3为体质健康，G4为美育素养，G5为劳动素养，G6为违纪扣分加种子银行加分。",
-                // Chunk 1
                 "G1评分等级：前10%得100分，10%-40%得95分，40%-80%得90分，80%-90%得85分，后10%得80分。",
-                // Chunk 2
                 "学业成绩G2计算：2021级 G2 = GPA×25。" +
                         "2022级及以后 G2 = 0.8×(GPA×25) + 0.2×(厚基础课程GPA×25)。" +
                         "厚基础课程包括：微积分、线性代数、大学物理、概率论与数理统计、计算方法、" +
                         "程序设计基础、离散数学、数据结构、软件工程导论、面向对象编程与设计、" +
                         "计算机网络、计算机组成原理、计算机操作系统、数据库系统、编译原理、" +
                         "算法分析与设计、软件测试、软件需求工程、信号与系统等22门课程。",
-                // Chunk 3
                 "学生干部加分：学生会主席A档30分B档24分C档18分，班长/团支书A档10分B档8分C档6分。",
-                // Chunk 4
                 "集体荣誉：国家级加40分，省级加20分，校级加8分，院级加4分。",
                 "语言加分：GRE320/TOEFL90/IELTS7/GMAT700各加10分（每年限1项）。" +
                         "CET-4达到650分或CET-6达到600分加10分。",
                 "学科竞赛加成：中国国际大学生创新大赛和挑战杯按150%系数计算。" +
                         "种子银行：参与活动次数X<3得0分，3≤X<6得0.5分，6≤X<10得1分，10≤X<15得2分，X≥15得3分。");
 
-        // ---- ACADEMIC: 竞赛名录 ----
         addDoc(store, "附件-西北工业大学认定的本科生学科竞赛项目名录（2026年版）", "ACADEMIC",
                 "竞赛项目按等级分为A1、A2、A3三类，共139项。其中A1级91项，A2级22项，A3级26项。" +
                         "A1竞赛系数为满分1.0，A2系数0.9，A3系数0.8。",
@@ -372,18 +463,15 @@ class RetrievalEvaluatorTest {
                         "全国大学生英语竞赛、国际大学生数学建模竞赛(MCM/ICM)、" +
                         "蓝桥杯全国软件和信息技术专业人才大赛、中国软件杯大学生软件设计大赛等。");
 
-        // ---- ACADEMIC: 软件工程培养方案 ----
         addDoc(store, "2021级信息大类-软件工程专业培养方案", "ACADEMIC",
                 "软件工程专业总学分要求167学分。其中通识类不少于82.5学分，" +
                         "学科专业类不少于84.5学分，个性发展类建议16学分，素质拓展类不少于4学分。",
-                "标准学制4年，弹性学习年限3-6年，最长在校时间不超过标准学制加2年。" +
-                        "学位：工学学士。",
+                "标准学制4年，弹性学习年限3-6年，最长在校时间不超过标准学制加2年。学位：工学学士。",
                 "专业方向：互联网系统开发、数据科学与智能服务、智能媒体计算三个方向。",
                 "毕业要求：掌握工程知识、问题分析、设计开发解决方案、研究能力、使用现代工具、" +
                         "工程与社会、环境与可持续发展、职业规范、个人与团队、沟通、" +
                         "项目管理、终身学习共12项核心能力。");
 
-        // ---- GUIDE: 瓜兵速成指南 ----
         addDoc(store, "瓜兵速成指南（2025版）", "GUIDE",
                 "长安校区宿舍分为星天苑、云天苑、海天苑三个区域。星天苑C-G和云天苑A-D为四人间，" +
                         "上床下桌，公共卫浴；星天苑A-B为四室一厅套间。",
@@ -396,14 +484,12 @@ class RetrievalEvaluatorTest {
                 "食堂：星天苑南餐厅、星天苑北餐厅、云天苑餐厅、海天苑餐厅共4个。外来人员加价20%。",
                 "2025级军训时间：8月25日至9月7日。长安校区作息时间第一节8:30-9:15。");
 
-        // ---- GUIDE: 四六级报名 ----
         addDoc(store, "全国大学英语四、六级考试报名操作手册", "GUIDE",
                 "四六级考试报名网站：https://cet-kw.neea.edu.cn/，选择省份陕西。" +
                         "虚拟校区代码：610022（西北工业大学虚拟校区）。",
                 "报名步骤：登录网站、确认学籍信息、选择实体校区（长安校区或友谊校区）、" +
                         "不要选候补报名、缴费后信息不可更改。口语考试为选考，需与笔试同一校区。");
 
-        // ---- SCHOLARSHIP: 专项奖学金评选通知 ----
         addDoc(store, "关于做好2023-2024学年本科生专项奖学金评选工作的通知（2023-2024）", "SCHOLARSHIP",
                 "国家奖学金和社会专项奖学金不能兼得。不同社会专项奖学金之间不能兼得。" +
                         "同一出资方的奖学金不能同时获得（如吴亚军奖学金和吴亚军助学金不能兼得）。",
@@ -412,7 +498,6 @@ class RetrievalEvaluatorTest {
                 "评选流程：发布条件→学院初审→不少于3个工作日公示→提交长安校区启真楼302。" +
                         "申请截止时间：航空工业10月8日16:00，其他10月30日11:00。");
 
-        // ---- SCHOLARSHIP: 奖学金设置摘要 ----
         addDoc(store, "本科生专项奖学金设置及评选摘要（2023-2024）", "SCHOLARSHIP",
                 "航空工业奖学金：一等10000元（10人）、二等6000元（24人），由中国航空工业集团出资。",
                 "中航技奖学金：8000元（10人），由中航技进出口有限责任公司出资。",
@@ -424,7 +509,6 @@ class RetrievalEvaluatorTest {
                         "面向6个学院大三及以上，特等前5%、一等前10%、二等前15%、三等前20%。",
                 "宁波未来之星奖学金：10000元（20人），由宁波市人社局出资，大三理工科，优先国家级科研成果。");
 
-        // ---- SCHOLARSHIP: 三星奖学金 ----
         addDoc(store, "关于做好2022-2023学年\"三星\"社会专项奖学金评选工作的通知", "SCHOLARSHIP",
                 "三星奖学金本科生5000元/人（8人），硕士生7000元/人（8人）。" +
                         "面向学院：材料学院、机电学院、电子信息学院、自动化学院、计算机学院、软件学院、微电子学院。" +
@@ -433,7 +517,6 @@ class RetrievalEvaluatorTest {
                 "三星奖学金与国家奖学金及其他社会专项奖学金不能兼得。" +
                         "申请截止时间：12月1日16:00。提交电子版至csas@nwpu.edu.cn，纸质版交启真楼302。");
 
-        // ---- OTHER: 体测标准 ----
         addDoc(store, "体测各项评分标准", "OTHER",
                 "男生1000米大一/大二及格标准为4分32秒，优秀标准为3分17秒。" +
                         "女生800米大一/大二及格标准为4分34秒，优秀标准为3分18秒。",
@@ -446,14 +529,12 @@ class RetrievalEvaluatorTest {
                 "肺活量：男生大一大二优秀5040ml，及格3100ml；女生大一大二优秀3400ml，及格2000ml。" +
                         "50米跑：男生大一大二优秀6.7秒，及格9.1秒；女生优秀7.5秒，及格10.3秒。");
 
-        // ---- OTHER: 评教通知 ----
         addDoc(store, "关于开展2024-2025学年秋季学期课程学生网上评教的通知", "OTHER",
                 "评教时间：2025年1月2日9:00至1月12日17:00。" +
                         "评教平台：翱翔教务→评教管理→学生总结性评教。",
                 "每位学生评教中优秀比例不能超过所评课程数的20%，系统自动限制。" +
                         "缺课1/3或作业缺交1/3的学生，其评教可被教师申请排除，截止1月19日。");
 
-        // ---- OTHER: 社会实践 ----
         addDoc(store, "关于开展2025年寒假大学生社会实践活动的通知", "OTHER",
                 "实践主题：青春为中国式现代化挺膺担当。6个类别：总师育人文化传承、岗位实习实践、" +
                         "乡情民情考察、服务家乡建设、学生大使招生实践、网络云实践。",
@@ -462,8 +543,7 @@ class RetrievalEvaluatorTest {
                 "2025寒假实践时间：报名1月6日-21日，实施1月10日-2月16日，总结评优2月16日-3月中旬。" +
                         "本课程为素质拓展课（2学分）。抄袭造假取消评优资格。");
 
-        System.out.println("  [评测] 已加载 " + store.size() + " 个模拟文档，共 "
-                + store.totalChunks() + " 个 chunk\n");
+        System.out.println("  [评测] 已加载 " + store.size() + " 个模拟文档，共 " + store.totalChunks() + " 个 chunk");
     }
 
     static long addDoc(KeywordVectorStore store, String title, String category, String... chunkTexts) {
