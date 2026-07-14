@@ -149,6 +149,84 @@ public class ChatController {
     }
 
     /**
+     * 删除会话（同时删除关联消息 + 清除缓存）
+     */
+    @DeleteMapping("/sessions/{sessionId}")
+    public Result deleteSession(@PathVariable String sessionId) {
+        User currentUser = userService.getCurrentUser();
+        if (currentUser == null) {
+            return Result.fail("请先登录");
+        }
+
+        ConversationSession session = sessionMapper.selectOne(
+                new LambdaQueryWrapper<ConversationSession>()
+                        .eq(ConversationSession::getSessionId, sessionId));
+        if (session == null) {
+            return Result.fail("会话不存在");
+        }
+
+        // 非管理员只能删除自己的会话
+        if (!"ADMIN".equals(currentUser.getRole())
+                && session.getUserId() != null
+                && !session.getUserId().equals(currentUser.getId())) {
+            return Result.fail("无权删除该会话");
+        }
+
+        // 删除关联消息
+        messageMapper.delete(new LambdaQueryWrapper<ConversationMessage>()
+                .eq(ConversationMessage::getSessionId, sessionId));
+        // 删除会话
+        sessionMapper.deleteById(session.getId());
+
+        // 清除相关缓存
+        redisTemplate.delete(HISTORY_CACHE_PREFIX + sessionId);
+        redisTemplate.delete(SESSIONS_CACHE_PREFIX + currentUser.getId());
+
+        return Result.ok("删除成功");
+    }
+
+    /**
+     * 重命名会话标题
+     */
+    @PutMapping("/sessions/{sessionId}")
+    public Result renameSession(@PathVariable String sessionId, @RequestBody Map<String, String> body) {
+        String title = body.get("title");
+        if (StrUtil.isBlank(title)) {
+            return Result.fail("标题不能为空");
+        }
+        if (title.length() > 100) {
+            return Result.fail("标题不能超过100个字符");
+        }
+
+        User currentUser = userService.getCurrentUser();
+        if (currentUser == null) {
+            return Result.fail("请先登录");
+        }
+
+        ConversationSession session = sessionMapper.selectOne(
+                new LambdaQueryWrapper<ConversationSession>()
+                        .eq(ConversationSession::getSessionId, sessionId));
+        if (session == null) {
+            return Result.fail("会话不存在");
+        }
+
+        // 非管理员只能重命名自己的会话
+        if (!"ADMIN".equals(currentUser.getRole())
+                && session.getUserId() != null
+                && !session.getUserId().equals(currentUser.getId())) {
+            return Result.fail("无权修改该会话");
+        }
+
+        session.setTitle(title.trim());
+        sessionMapper.updateById(session);
+
+        // 清除相关缓存
+        redisTemplate.delete(SESSIONS_CACHE_PREFIX + currentUser.getId());
+
+        return Result.ok("重命名成功");
+    }
+
+    /**
      * 查询对话历史
      */
     @GetMapping("/history/{sessionId}")

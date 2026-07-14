@@ -38,3 +38,32 @@ export function register(params: RegisterParams): Promise<LoginResult> {
 export function getMe(): Promise<UserInfo> {
   return api.get('/auth/me').then(res => res.data.data)
 }
+
+// ==================== 用户管理（管理员） ====================
+
+export interface PageResult<T> {
+  records: T[]
+  total: number
+  current: number
+  size: number
+}
+
+export function listUsers(page = 1, size = 10): Promise<PageResult<UserInfo>> {
+  return api.get('/admin/users', { params: { page, size } }).then(res => res.data.data)
+}
+
+export function createUser(data: { username: string; password: string; role: string }): Promise<void> {
+  return api.post('/admin/users', data)
+}
+
+export function updateUser(id: number, data: { username?: string; role?: string; status?: string }): Promise<void> {
+  return api.put(`/admin/users/${id}`, data)
+}
+
+export function resetUserPassword(id: number, password: string): Promise<void> {
+  return api.put(`/admin/users/${id}/password`, { password })
+}
+
+export function deleteUser(id: number): Promise<void> {
+  return api.delete(`/admin/users/${id}`)
+}

@@ -39,6 +39,14 @@ export async function getHistory(sessionId: string): Promise<any[]> {
   return res.data.data || []
 }
 
+export async function deleteSession(sessionId: string): Promise<void> {
+  await api.delete(`/chat/sessions/${sessionId}`)
+}
+
+export async function renameSession(sessionId: string, title: string): Promise<void> {
+  await api.put(`/chat/sessions/${sessionId}`, { title })
+}
+
 // ==================== SSE 流式问答 ====================
 
 export interface StreamCallbacks {

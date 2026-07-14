@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, nextTick, onMounted, computed } from 'vue'
+import { ref, nextTick, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
-import { askStream, getHistory, getSessions, type AskResponse, type SourceInfo } from '../api/chat'
+import { askStream, getHistory, getSessions, deleteSession, renameSession, type AskResponse, type SourceInfo } from '../api/chat'
 import { getDocumentContent, type DocumentContent } from '../api/document'
 import PdfViewer from '../components/PdfViewer.vue'
 import { marked } from 'marked'
@@ -11,6 +11,9 @@ const router = useRouter()
 
 // ========== 侧边栏 ==========
 const sidebarOpen = ref(false)
+
+// ========== 侧边栏折叠（桌面端） ==========
+const sidebarCollapsed = ref(false)
 
 // ========== 会话管理 ==========
 interface Conversation {
@@ -35,6 +38,11 @@ const streaming = ref(false)
 const messageContainer = ref<HTMLElement | null>(null)
 const messageCache = new Map<string, ChatMessage[]>()
 const switching = ref(false)
+
+// ========== 重命名状态 ==========
+const editingId = ref<string>('')
+const editTitle = ref('')
+const editInputRef = ref<HTMLInputElement | null>(null)
 
 async function switchConversation(id: string) {
   if (activeId.value) {
@@ -79,13 +87,45 @@ function newConversation() {
   sidebarOpen.value = false
 }
 
-function deleteConversation(id: string) {
+async function deleteConversation(id: string) {
+  try {
+    await deleteSession(id)
+  } catch {
+    MessagePlugin.error('删除失败')
+    return
+  }
   conversations.value = conversations.value.filter(c => c.id !== id)
   messageCache.delete(id)
   if (activeId.value === id) {
     activeId.value = ''
     messages.value = []
   }
+}
+
+function startRename(conv: Conversation) {
+  editingId.value = conv.id
+  editTitle.value = conv.title
+  nextTick(() => {
+    editInputRef.value?.focus()
+    editInputRef.value?.select()
+  })
+}
+
+async function confirmRename(conv: Conversation) {
+  const newTitle = editTitle.value.trim()
+  editingId.value = ''
+  if (!newTitle || newTitle === conv.title) return
+  try {
+    await renameSession(conv.id, newTitle)
+    conv.title = newTitle
+  } catch {
+    MessagePlugin.error('重命名失败')
+  }
+}
+
+function cancelRename() {
+  editingId.value = ''
+  editTitle.value = ''
 }
 
 // ========== 发送消息 ==========
@@ -299,6 +339,27 @@ onMounted(async () => {
 const showWelcome = computed(() => !loading && !switching.value && messages.value.length === 0)
 const hasConversations = computed(() => conversations.value.length > 0)
 
+// ========== 动态页面标题 ==========
+const pageTitle = computed(() => {
+  const conv = conversations.value.find(c => c.id === activeId.value)
+  return conv ? `${conv.title} - 校园智答` : '校园智答'
+})
+watch(pageTitle, (title) => { document.title = title }, { immediate: true })
+
+// ========== 顶部栏标题 ==========
+const topBarTitle = computed(() => {
+  const conv = conversations.value.find(c => c.id === activeId.value)
+  return conv ? conv.title : '校园智答'
+})
+
+function toggleSidebar() {
+  if (window.innerWidth < 1024) {
+    sidebarOpen.value = false
+  } else {
+    sidebarCollapsed.value = !sidebarCollapsed.value
+  }
+}
+
 const suggestedQuestions = [
   '奖学金评定标准是什么？',
   '选课流程是怎样的？',
@@ -314,16 +375,17 @@ const suggestedQuestions = [
     <div v-if="sidebarOpen" class="ds-overlay" @click="sidebarOpen = false" />
 
     <!-- ==================== 侧边栏抽屉 ==================== -->
-    <aside class="ds-sidebar" :class="{ open: sidebarOpen }">
+    <aside class="ds-sidebar" :class="{ open: sidebarOpen, collapsed: sidebarCollapsed }">
       <div class="ds-sidebar-header">
-        <span class="ds-sidebar-title">校园智答</span>
-        <t-button variant="text" size="small" @click="sidebarOpen = false">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        <img src="/智能问答.svg" width="22" height="22" alt="logo" class="ds-sidebar-logo" />
+        <span class="ds-sidebar-title" v-show="!sidebarCollapsed">校园智答</span>
+        <t-button variant="text" size="small" @click="toggleSidebar">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 17l-5-5 5-5"/><path d="M18 17l-5-5 5-5"/></svg>
         </t-button>
       </div>
 
       <t-button block theme="primary" variant="outline" @click="newConversation" style="margin-bottom:16px">
-        + 新建对话
+        <span v-show="!sidebarCollapsed">+ 新建对话</span>
       </t-button>
 
       <div class="ds-conv-list" v-if="hasConversations">
@@ -332,13 +394,27 @@ const suggestedQuestions = [
           :key="conv.id"
           class="ds-conv-item"
           :class="{ active: conv.id === activeId }"
-          @click="switchConversation(conv.id)"
+          @click="editingId === conv.id ? undefined : switchConversation(conv.id)"
+          @dblclick="startRename(conv)"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0">
             <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
           </svg>
-          <span class="ds-conv-title">{{ conv.title }}</span>
-          <t-popconfirm content="删除？" @confirm="deleteConversation(conv.id)">
+          <!-- 编辑模式 -->
+          <input
+            v-if="editingId === conv.id"
+            ref="editInputRef"
+            v-model="editTitle"
+            class="ds-conv-edit-input"
+            maxlength="100"
+            @keydown.enter="confirmRename(conv)"
+            @keydown.escape="cancelRename"
+            @blur="confirmRename(conv)"
+            @click.stop
+          />
+          <!-- 展示模式 -->
+          <span v-else class="ds-conv-title" v-show="!sidebarCollapsed">{{ conv.title }}</span>
+          <t-popconfirm content="确定删除该对话？" @confirm="deleteConversation(conv.id)">
             <t-button variant="text" size="small" shape="square" class="ds-conv-del">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
             </t-button>
@@ -346,15 +422,9 @@ const suggestedQuestions = [
         </div>
       </div>
       <div v-else style="color:#999;font-size:13px;text-align:center;padding:20px">
-        暂无对话记录
+        <span v-show="!sidebarCollapsed">暂无对话记录</span>
       </div>
 
-      <div class="ds-sidebar-footer">
-        <t-button variant="text" block @click="router.push('/documents')">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:6px"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-          文档管理
-        </t-button>
-      </div>
     </aside>
 
     <!-- ==================== 主体 ==================== -->
@@ -362,10 +432,7 @@ const suggestedQuestions = [
       <!-- 顶部栏 -->
       <header class="ds-topbar">
         <div class="ds-topbar-left">
-          <t-button variant="text" shape="square" @click="sidebarOpen = true">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-          </t-button>
-          <span class="ds-logo" @click="activeId='';messages=[]">校园智答</span>
+          <span class="ds-logo" @click="activeId='';messages=[]">{{ topBarTitle }}</span>
         </div>
         <div class="ds-topbar-right">
           <t-button variant="text" @click="newConversation">
@@ -587,11 +654,33 @@ const suggestedQuestions = [
   flex-direction: column;
   padding: 16px;
   transform: translateX(-100%);
-  transition: transform 0.25s ease;
+  transition: transform 0.25s ease, width 0.25s ease, min-width 0.25s ease;
 }
 
 .ds-sidebar.open {
   transform: translateX(0);
+}
+
+/* 桌面端折叠：窄栏仅图标 */
+.ds-sidebar.collapsed {
+  width: auto;
+  min-width: 56px;
+  padding: 16px 10px;
+  align-items: center;
+}
+
+.ds-sidebar.collapsed .ds-sidebar-header {
+  justify-content: center;
+}
+
+.ds-sidebar.collapsed .ds-conv-item {
+  justify-content: center;
+  padding: 10px 6px;
+}
+
+
+.ds-sidebar.collapsed .ds-conv-del {
+  display: none;
 }
 
 .ds-sidebar-header {
@@ -599,6 +688,12 @@ const suggestedQuestions = [
   align-items: center;
   justify-content: space-between;
   margin-bottom: 16px;
+}
+
+.ds-sidebar-logo {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
 }
 
 .ds-sidebar-title {
@@ -635,14 +730,23 @@ const suggestedQuestions = [
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.ds-conv-edit-input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  font-size: 13px;
+  font-family: inherit;
+  border: 1px solid #0052d9;
+  border-radius: 4px;
+  outline: none;
+  background: #fff;
+  color: #333;
+  line-height: 1.5;
+}
 
 .ds-conv-del { opacity: 0; }
 .ds-conv-item:hover .ds-conv-del { opacity: 0.6; }
 
-.ds-sidebar-footer {
-  border-top: 1px solid #e5e7eb;
-  padding-top: 12px;
-}
 
 /* ==================== 主体 ==================== */
 .ds-main {
@@ -815,7 +919,7 @@ const suggestedQuestions = [
 
 /* ==================== 底部输入栏 ==================== */
 .ds-input-bar {
-  padding: 12px 24px 8px;
+  padding: 12px 24px 80px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1002,6 +1106,8 @@ const suggestedQuestions = [
   .ds-sidebar {
     position: static;
     transform: none;
+  }
+  .ds-sidebar:not(.collapsed) {
     width: 17%;
     min-width: 240px;
   }
@@ -1010,7 +1116,7 @@ const suggestedQuestions = [
 
 @media (max-width: 640px) {
   .ds-msg-inner { padding: 0 12px; }
-  .ds-input-bar { padding: 12px 12px 8px; }
+  .ds-input-bar { padding: 12px 12px 60px; }
   .ds-disclaimer { display: none; }
 }
 

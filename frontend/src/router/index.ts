@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import LayoutView from '../views/LayoutView.vue'
 import ChatView from '../views/ChatView.vue'
 import DocumentView from '../views/DocumentView.vue'
+import UserManageView from '../views/UserManageView.vue'
 import LoginView from '../views/LoginView.vue'
 import RegisterView from '../views/RegisterView.vue'
 
@@ -26,7 +27,8 @@ const router = createRouter({
       meta: { requiresAuth: true },
       children: [
         { path: '', name: 'chat', component: ChatView },
-        { path: 'documents', name: 'documents', component: DocumentView }
+        { path: 'documents', name: 'documents', component: DocumentView },
+        { path: 'users', name: 'users', component: UserManageView }
       ]
     }
   ]

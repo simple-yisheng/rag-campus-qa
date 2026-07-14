@@ -52,7 +52,7 @@ function isActive(path: string) {
   <div class="layout">
     <header class="layout-header">
       <div class="header-left">
-        <span class="header-logo" @click="goChat">🎓 校园智答</span>
+        <span class="header-logo" @click="goChat"><img src="/智能问答.svg" width="22" height="22" alt="logo" style="vertical-align:middle;margin-right:6px" />校园智答</span>
         <nav class="header-nav">
           <t-button
             :variant="isActive('/') ? 'base' : 'text'"
@@ -69,6 +69,15 @@ function isActive(path: string) {
             @click="goDocuments"
           >
             文档管理
+          </t-button>
+          <t-button
+            v-if="user?.role === 'ADMIN'"
+            :variant="isActive('/users') ? 'base' : 'text'"
+            :theme="isActive('/users') ? 'primary' : 'default'"
+            size="small"
+            @click="router.push('/users')"
+          >
+            用户管理
           </t-button>
         </nav>
       </div>
@@ -90,7 +99,8 @@ function isActive(path: string) {
 .layout {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .layout-header {

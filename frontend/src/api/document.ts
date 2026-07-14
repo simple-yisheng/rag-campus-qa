@@ -20,8 +20,15 @@ export interface UploadResult {
   message: string
 }
 
-export async function listDocuments(): Promise<DocumentInfo[]> {
-  const res = await api.get('/documents')
+export interface PageResult<T> {
+  records: T[]
+  total: number
+  current: number
+  size: number
+}
+
+export async function listDocuments(page = 1, size = 10): Promise<PageResult<DocumentInfo>> {
+  const res = await api.get('/documents', { params: { page, size } })
   return res.data.data
 }
 

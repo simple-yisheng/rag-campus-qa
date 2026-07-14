@@ -188,12 +188,18 @@ public class DocumentController {
     }
 
     /**
-     * 查询所有文档
+     * 分页查询所有文档
      */
     @GetMapping
-    public Result listAll() {
-        List<Document> documents = documentService.listAll();
-        return Result.ok(documents);
+    public Result listAll(@RequestParam(defaultValue = "1") int page,
+                          @RequestParam(defaultValue = "10") int size) {
+        var pageResult = documentService.listAll(page, size);
+        Map<String, Object> data = new HashMap<>();
+        data.put("records", pageResult.getRecords());
+        data.put("total", pageResult.getTotal());
+        data.put("current", pageResult.getCurrent());
+        data.put("size", pageResult.getSize());
+        return Result.ok(data);
     }
 
     /**

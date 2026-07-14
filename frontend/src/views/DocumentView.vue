@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessagePlugin } from 'tdesign-vue-next'
-import { listDocuments, uploadDocument, deleteDocument, reviewDocument, type DocumentInfo } from '../api/document'
+import { listDocuments, uploadDocument, deleteDocument, reviewDocument, type DocumentInfo, type PageResult } from '../api/document'
 
 const router = useRouter()
 
@@ -13,14 +13,23 @@ try {
   isAdmin.value = user.role === 'ADMIN'
 } catch { /* ignore */ }
 
-// ========== 文档列表 ==========
+// ========== 文档列表（分页） ==========
 const documents = ref<DocumentInfo[]>([])
 const loading = ref(false)
+const currentPage = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
+const pageSizeOptions = [
+  { label: '5 条/页', value: 5 },
+  { label: '10 条/页', value: 10 }
+]
 
 async function fetchDocuments() {
   loading.value = true
   try {
-    documents.value = await listDocuments()
+    const result: PageResult<DocumentInfo> = await listDocuments(currentPage.value, pageSize.value)
+    documents.value = result.records
+    total.value = result.total
   } catch {
     MessagePlugin.error('获取文档列表失败')
   } finally {
@@ -28,7 +37,19 @@ async function fetchDocuments() {
   }
 }
 
+function onPageChange(page: number) {
+  currentPage.value = page
+  fetchDocuments()
+}
+
+function onPageSizeChange(size: number) {
+  pageSize.value = size
+  currentPage.value = 1
+  fetchDocuments()
+}
+
 // ========== 上传 ==========
+const uploadVisible = ref(false)
 const uploadForm = ref({
   title: '',
   category: 'POLICY',
@@ -69,11 +90,12 @@ async function handleUpload() {
       MessagePlugin.error(res.message)
     } else {
       MessagePlugin.success(res.message)
-      // 清空表单
+      // 清空表单并关闭弹窗
       uploadForm.value.title = ''
       uploadForm.value.department = ''
       selectedFile = null;
       (document.getElementById('file-input') as HTMLInputElement).value = ''
+      uploadVisible.value = false
       fetchDocuments()
     }
   } catch {
@@ -161,17 +183,17 @@ onMounted(fetchDocuments)
     </header>
 
     <main class="doc-main">
-      <!-- 上传区域 -->
-      <t-card title="上传文档" style="margin-bottom: 24px">
-        <t-form layout="inline">
+      <!-- 上传弹窗 -->
+      <t-dialog v-model:visible="uploadVisible" header="上传文档" width="600px" :footer="false">
+        <t-form label-width="60px">
           <t-form-item label="标题">
-            <t-input v-model="uploadForm.title" placeholder="不填则使用文件名" style="width:200px" />
+            <t-input v-model="uploadForm.title" placeholder="不填则使用文件名" />
           </t-form-item>
           <t-form-item label="分类">
-            <t-select v-model="uploadForm.category" :options="categoryOptions" style="width:140px" />
+            <t-select v-model="uploadForm.category" :options="categoryOptions" />
           </t-form-item>
           <t-form-item label="部门">
-            <t-input v-model="uploadForm.department" placeholder="发布单位" style="width:160px" />
+            <t-input v-model="uploadForm.department" placeholder="发布单位" />
           </t-form-item>
           <t-form-item label="文件">
             <input id="file-input" type="file" accept=".pdf,.docx,.doc,.txt,.md,.markdown" @change="onFileChange" />
@@ -180,10 +202,14 @@ onMounted(fetchDocuments)
             <t-button theme="primary" @click="handleUpload" :loading="uploading">上传</t-button>
           </t-form-item>
         </t-form>
-      </t-card>
+      </t-dialog>
 
       <!-- 文档列表 -->
-      <t-card :title="`文档列表（共 ${documents.length} 篇）`">
+      <t-card class="document-card">
+        <div class="document-card-toolbar">
+          <span class="document-card-title">文档列表（共 {{ total }} 篇）</span>
+          <t-button class="document-upload-button" theme="primary" @click="uploadVisible = true">上传文档</t-button>
+        </div>
         <t-table
           :data="documents"
           :columns="columns"
@@ -237,6 +263,17 @@ onMounted(fetchDocuments)
             </t-popconfirm>
           </template>
         </t-table>
+        <div style="margin-top:16px;display:flex;justify-content:flex-end">
+          <t-pagination
+            v-model:current="currentPage"
+            v-model:pageSize="pageSize"
+            :total="total"
+            :page-size-options="pageSizeOptions"
+            show-page-size
+            @current-change="onPageChange"
+            @page-size-change="onPageSizeChange"
+          />
+        </div>
       </t-card>
     </main>
   </div>
@@ -252,7 +289,7 @@ onMounted(fetchDocuments)
 .doc-main {
   flex: 1;
   overflow-y: auto;
-  padding: 24px;
+  padding: 24px 24px 64px;
   max-width: 1100px;
   margin: 0 auto;
   width: 100%;
@@ -260,5 +297,39 @@ onMounted(fetchDocuments)
 
 input[type="file"] {
   font-size: 13px;
+}
+
+.document-card-toolbar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 56px;
+  margin-bottom: 16px;
+}
+
+.document-card-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.document-upload-button {
+  position: absolute;
+  left: 52%;
+  transform: translateX(-50%);
+}
+
+@media (max-width: 720px) {
+  .document-card-toolbar {
+    gap: 12px;
+    justify-content: space-between;
+  }
+
+  .document-upload-button {
+    position: static;
+    margin-left: auto;
+    transform: none;
+  }
 }
 </style>

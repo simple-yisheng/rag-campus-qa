@@ -1,5 +1,6 @@
 package com.rag.campus.service;
 
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.rag.campus.dto.DocumentUploadResult;
 import com.rag.campus.entity.Document;
 import com.rag.campus.entity.DocumentChunk;
@@ -30,9 +31,9 @@ public interface DocumentService {
     DocumentUploadResult upload(MultipartFile file, String title, String category, String department);
 
     /**
-     * 查询所有文档
+     * 分页查询文档
      */
-    List<Document> listAll();
+    Page<Document> listAll(int page, int size);
 
     /**
      * 根据ID查询文档

@@ -12,7 +12,9 @@
 |:---:|:---:|:---:|
 | 支持 PDF/Word/TXT/MD | 多轮对话 + 查询改写 | 点击参考资料 → 侧边抽屉 |
 | MD5 去重 + 表格感知分块 | 检索增强（关键词/标题/多样性） | PDF.js 渲染 + 文字高亮定位 |
-| Word 自动转 PDF 预览 | DeepSeek LLM 生成 | 页码精确跳转 |
+| 4级自适应分块 + 文档审核 | 侧边栏收缩 + 动态标题 | MD marked 渲染 + PDF.js |
+| **文档管理** | **会话管理** | **用户管理（管理员）** |
+| 分页展示 + 弹窗上传 | 删除/重命名 + SSE流式 | CRUD + 密码重置 + 禁用/启用 |
 
 ---
 
@@ -158,7 +160,7 @@ rag-campus-qa/
 │       ├── router/index.ts
 │       ├── api/index.ts, auth.ts, chat.ts, document.ts
 │       ├── components/PdfViewer.vue       # PDF.js 渲染 + 高亮组件
-│       └── views/{ChatView,DocumentView,LoginView,RegisterView,LayoutView}
+│       └── views/{ChatView,DocumentView,UserManageView,LoginView,RegisterView,LayoutView}
 │
 ├── src/main/resources/
 │   ├── application.yaml                  # 主配置（可提交）
@@ -205,12 +207,13 @@ rag-campus-qa/
 | 方法 | 路径 | 说明 |
 |:---|:---|:---|
 | POST | `/api/documents/upload` | 上传文档（form-data: file, title?, category, department?） |
-| GET | `/api/documents` | 文档列表 |
+| GET | `/api/documents` | 文档列表（分页，?page=1&size=10） |
 | GET | `/api/documents/{id}` | 文档详情 |
 | GET | `/api/documents/{id}/file` | 下载/预览原始文件（?download=true 强制下载） |
 | GET | `/api/documents/{id}/preview` | PDF 预览（PDF 原生 / Word→PDF 转换） |
 | GET | `/api/documents/{id}/content` | 文档完整文本 + chunk 列表（参考资料抽屉用） |
 | DELETE | `/api/documents/{id}` | 删除文档（级联 chunks + MinIO + 向量索引） |
+| PUT | `/api/documents/{id}/review` | 审核文档 `{ "approved": true/false }` |
 
 ### 对话
 
@@ -220,13 +223,20 @@ rag-campus-qa/
 | POST | `/api/chat/ask/stream` | RAG 问答（**SSE 流式**）— 打字机效果，`text/event-stream` |
 | GET | `/api/chat/sessions` | 当前用户的会话列表 |
 | GET | `/api/chat/history/{sessionId}` | 查询指定会话的对话历史 |
+| DELETE | `/api/chat/sessions/{sessionId}` | 删除会话（含关联消息+缓存） |
+| PUT | `/api/chat/sessions/{sessionId}` | 重命名会话 `{ "title": "新标题" }` |
 
-### 审核（管理员）
+### 管理（管理员）
 
 | 方法 | 路径 | 说明 |
 |:---|:---|:---|
-| PUT | `/api/documents/{id}/review` | 审核文档 `{ "approved": true/false }` — 通过→进入处理，驳回→不可检索 |
-| GET | `/api/admin/vector-stats` | 向量存储统计（管理员） |
+| GET | `/api/admin/vector-stats` | 向量存储统计 |
+| GET | `/api/admin/users?page=1&size=10` | 用户列表（分页） |
+| POST | `/api/admin/users` | 创建用户 `{ "username","password","role" }` |
+| PUT | `/api/admin/users/{id}` | 编辑用户（用户名/角色/状态） |
+| PUT | `/api/admin/users/{id}/password` | 重置密码 `{ "password" }` |
+| DELETE | `/api/admin/users/{id}` | 删除用户（不能删管理员） |
+| PUT | `/api/documents/{id}/review` | 审核文档 `{ "approved": true/false }` |
 
 ---
 

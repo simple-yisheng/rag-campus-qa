@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.crypto.digest.DigestUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.rag.campus.client.EmbeddingClient;
 import com.rag.campus.dto.DocumentUploadResult;
 import com.rag.campus.entity.Document;
@@ -218,7 +219,7 @@ public class DocumentServiceImpl implements DocumentService {
     }
 
     @Override
-    public List<Document> listAll() {
+    public Page<Document> listAll(int page, int size) {
         LambdaQueryWrapper<Document> wrapper = new LambdaQueryWrapper<Document>()
                 .orderByDesc(Document::getCreateTime);
 
@@ -228,7 +229,7 @@ public class DocumentServiceImpl implements DocumentService {
             wrapper.eq(Document::getUploaderId, currentUser.getId());
         }
 
-        return documentMapper.selectList(wrapper);
+        return documentMapper.selectPage(new Page<>(page, size), wrapper);
     }
 
     @Override
